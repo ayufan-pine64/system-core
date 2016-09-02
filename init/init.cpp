@@ -340,7 +340,7 @@ static int set_mmap_rnd_bits_action(const std::vector<std::string>& args)
 #endif
     if (ret == -1) {
         ERROR("Unable to set adequate mmap entropy value!\n");
-        security_failure();
+        // security_failure();
     }
     return ret;
 }
@@ -569,7 +569,7 @@ static void selinux_initialize(bool in_kernel_domain) {
             if (security_setenforce(is_enforcing)) {
                 ERROR("security_setenforce(%s) failed: %s\n",
                       is_enforcing ? "true" : "false", strerror(errno));
-                security_failure();
+                // security_failure();
             }
         }
 

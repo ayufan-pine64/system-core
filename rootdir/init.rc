@@ -279,7 +279,7 @@ on post-fs
     mount none /mnt/runtime/default /storage slave bind rec
 
     # Make sure /sys/kernel/debug (if present) is labeled properly
-    restorecon_recursive /sys/kernel/debug
+    # restorecon_recursive /sys/kernel/debug
 
     # We chown/chmod /cache again so because mount is run as root + defaults
     chown system cache /cache
