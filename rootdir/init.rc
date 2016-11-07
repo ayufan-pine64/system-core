@@ -626,9 +626,8 @@ service console /system/bin/sh
     class core
     console
     disabled
-    user shell
-    group shell log readproc
-    seclabel u:r:shell:s0
+    group root shell log readproc
+    seclabel u:r:su:s0
 
 on property:ro.debuggable=1
     # Give writes to anyone for the trace folder on debug builds.
