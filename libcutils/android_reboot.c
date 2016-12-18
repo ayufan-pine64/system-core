@@ -209,11 +209,28 @@ out:
     free_entries(&ro_entries);
 }
 
+static void write_reboot_mode(const char *arg)
+{
+  if (arg && strcmp(arg, "recovery") == 0) {
+    int fd = open("/bootloader/recovery.txt", O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+  } else {
+    unlink("/bootloader/recovery.txt");
+  }
+}
+
 int android_reboot_with_callback(
     int cmd, int flags __unused, const char *arg,
     void (*cb_on_remount)(const struct mntent*))
 {
     int ret;
+
+    if (arg) {
+      write_reboot_mode(arg);
+    }
+
     remount_ro(cb_on_remount);
     switch (cmd) {
         case ANDROID_RB_RESTART:
