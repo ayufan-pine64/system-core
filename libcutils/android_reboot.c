@@ -88,10 +88,25 @@ static void remount_ro(void)
     return;
 }
 
+static void write_reboot_mode(const char *arg)
+{
+  if (arg && strcmp(arg, "recovery") == 0) {
+    int fd = open("/bootloader/recovery.txt", O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+    }
+  } else {
+    unlink("/bootloader/recovery.txt");
+  }
+}
 
 int android_reboot(int cmd, int flags UNUSED, const char *arg)
 {
     int ret;
+
+    if (arg) {
+      write_reboot_mode(arg);
+    }
 
     sync();
     remount_ro();
@@ -116,4 +131,3 @@ int android_reboot(int cmd, int flags UNUSED, const char *arg)
 
     return ret;
 }
-
