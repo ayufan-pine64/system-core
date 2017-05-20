@@ -43,7 +43,7 @@ void add_service_keycodes(Service* svc)
         size = sizeof(*keychord) + svc->keycodes().size() * sizeof(keychord->keycodes[0]);
         keychords = (input_keychord*) realloc(keychords, keychords_length + size);
         if (!keychords) {
-            ERROR("could not allocate keychords\n");
+            PLOG(ERROR) << "could not allocate keychords";
             keychords_length = 0;
             keychords_count = 0;
             return;
@@ -69,7 +69,7 @@ static void handle_keychord() {
 
     ret = read(keychord_fd, &id, sizeof(id));
     if (ret != sizeof(id)) {
-        ERROR("could not read keychord id\n");
+        PLOG(ERROR) << "could not read keychord id";
         return;
     }
 
@@ -78,11 +78,13 @@ static void handle_keychord() {
     if (adb_enabled == "running") {
         Service* svc = ServiceManager::GetInstance().FindServiceByKeychord(id);
         if (svc) {
-            INFO("Starting service %s from keychord\n", svc->name().c_str());
+            LOG(INFO) << "Starting service " << svc->name() << " from keychord " << id;
             svc->Start();
         } else {
-            ERROR("service for keychord %d not found\n", id);
+            LOG(ERROR) << "Service for keychord " << id << " not found";
         }
+    } else {
+        LOG(WARNING) << "Not starting service for keychord " << id << " because ADB is disabled";
     }
 }
 
@@ -96,13 +98,13 @@ void keychord_init() {
 
     keychord_fd = TEMP_FAILURE_RETRY(open("/dev/keychord", O_RDWR | O_CLOEXEC));
     if (keychord_fd == -1) {
-        ERROR("could not open /dev/keychord: %s\n", strerror(errno));
+        PLOG(ERROR) << "could not open /dev/keychord";
         return;
     }
 
     int ret = write(keychord_fd, keychords, keychords_length);
     if (ret != keychords_length) {
-        ERROR("could not configure /dev/keychord %d: %s\n", ret, strerror(errno));
+        PLOG(ERROR) << "could not configure /dev/keychord " << ret;
         close(keychord_fd);
     }
 

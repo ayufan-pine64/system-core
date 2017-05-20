@@ -52,18 +52,6 @@ TEST(adb_utils, directory_exists) {
 
   ASSERT_TRUE(directory_exists(profiles_dir));
 
-  // On modern (English?) Windows, this is a directory symbolic link to
-  // C:\ProgramData. Symbolic links are rare on Windows and the user requires
-  // a special permission (by default granted to Administrative users) to
-  // create symbolic links.
-  ASSERT_FALSE(directory_exists(subdir(profiles_dir, "All Users")));
-
-  // On modern (English?) Windows, this is a directory junction to
-  // C:\Users\Default. Junctions are used throughout user profile directories
-  // for backwards compatibility and they don't require any special permissions
-  // to create.
-  ASSERT_FALSE(directory_exists(subdir(profiles_dir, "Default User")));
-
   ASSERT_FALSE(directory_exists(subdir(profiles_dir, "does-not-exist")));
 #else
   ASSERT_TRUE(directory_exists("/proc"));
@@ -71,6 +59,28 @@ TEST(adb_utils, directory_exists) {
   ASSERT_FALSE(directory_exists("/proc/does-not-exist"));
 #endif
 }
+
+#if defined(_WIN32)
+TEST(adb_utils, directory_exists_win32_symlink_junction) {
+  char profiles_dir[MAX_PATH];
+  DWORD cch = arraysize(profiles_dir);
+
+  // On typical Windows 7, returns C:\Users
+  ASSERT_TRUE(GetProfilesDirectoryA(profiles_dir, &cch));
+
+  // On modern (English?) Windows, this is a directory symbolic link to
+  // C:\ProgramData. Symbolic links are rare on Windows and the user requires
+  // a special permission (by default granted to Administrative users) to
+  // create symbolic links.
+  EXPECT_FALSE(directory_exists(subdir(profiles_dir, "All Users")));
+
+  // On modern (English?) Windows, this is a directory junction to
+  // C:\Users\Default. Junctions are used throughout user profile directories
+  // for backwards compatibility and they don't require any special permissions
+  // to create.
+  EXPECT_FALSE(directory_exists(subdir(profiles_dir, "Default User")));
+}
+#endif
 
 TEST(adb_utils, escape_arg) {
   ASSERT_EQ(R"('')", escape_arg(""));
@@ -99,28 +109,22 @@ TEST(adb_utils, escape_arg) {
   ASSERT_EQ(R"('abc)')", escape_arg("abc)"));
 }
 
-TEST(adb_utils, adb_basename) {
-  EXPECT_EQ("sh", adb_basename("/system/bin/sh"));
-  EXPECT_EQ("sh", adb_basename("sh"));
-  EXPECT_EQ("sh", adb_basename("/system/bin/sh/"));
-}
-
-TEST(adb_utils, adb_dirname) {
-  EXPECT_EQ("/system/bin", adb_dirname("/system/bin/sh"));
-  EXPECT_EQ(".", adb_dirname("sh"));
-  EXPECT_EQ("/system/bin", adb_dirname("/system/bin/sh/"));
-}
-
-void test_mkdirs(const std::string basepath) {
+void test_mkdirs(const std::string& basepath) {
   // Test creating a directory hierarchy.
-  EXPECT_TRUE(mkdirs(basepath));
+  ASSERT_TRUE(mkdirs(basepath));
   // Test finding an existing directory hierarchy.
-  EXPECT_TRUE(mkdirs(basepath));
+  ASSERT_TRUE(mkdirs(basepath));
+  // Test mkdirs on an existing hierarchy with a trailing slash.
+  ASSERT_TRUE(mkdirs(basepath + '/'));
+#if defined(_WIN32)
+  ASSERT_TRUE(mkdirs(basepath + '\\'));
+#endif
+
   const std::string filepath = basepath + "/file";
   // Verify that the hierarchy was created by trying to create a file in it.
-  EXPECT_NE(-1, adb_creat(filepath.c_str(), 0600));
+  ASSERT_NE(-1, adb_creat(filepath.c_str(), 0600));
   // If a file exists where we want a directory, the operation should fail.
-  EXPECT_FALSE(mkdirs(filepath));
+  ASSERT_FALSE(mkdirs(filepath));
 }
 
 TEST(adb_utils, mkdirs) {
@@ -149,3 +153,24 @@ TEST(adb_utils, set_file_block_mode) {
   ASSERT_EQ(0, adb_close(fd));
 }
 #endif
+
+TEST(adb_utils, test_forward_targets_are_valid) {
+    std::string error;
+
+    // Source port can be >= 0.
+    EXPECT_FALSE(forward_targets_are_valid("tcp:-1", "tcp:9000", &error));
+    EXPECT_TRUE(forward_targets_are_valid("tcp:0", "tcp:9000", &error));
+    EXPECT_TRUE(forward_targets_are_valid("tcp:8000", "tcp:9000", &error));
+
+    // Destination port must be >0.
+    EXPECT_FALSE(forward_targets_are_valid("tcp:8000", "tcp:-1", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:8000", "tcp:0", &error));
+
+    // Port must be a number.
+    EXPECT_FALSE(forward_targets_are_valid("tcp:", "tcp:9000", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:a", "tcp:9000", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:22x", "tcp:9000", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:8000", "tcp:", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:8000", "tcp:a", &error));
+    EXPECT_FALSE(forward_targets_are_valid("tcp:8000", "tcp:22x", &error));
+}

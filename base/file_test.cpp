@@ -45,6 +45,24 @@ TEST(file, ReadFileToString_WriteStringToFile) {
   EXPECT_EQ("abc", s);
 }
 
+// symlinks require elevated privileges on Windows.
+#if !defined(_WIN32)
+TEST(file, ReadFileToString_WriteStringToFile_symlink) {
+  TemporaryFile target, link;
+  ASSERT_EQ(0, unlink(link.path));
+  ASSERT_EQ(0, symlink(target.path, link.path));
+  ASSERT_FALSE(android::base::WriteStringToFile("foo", link.path, false));
+  ASSERT_EQ(ELOOP, errno);
+  ASSERT_TRUE(android::base::WriteStringToFile("foo", link.path, true));
+
+  std::string s;
+  ASSERT_FALSE(android::base::ReadFileToString(link.path, &s));
+  ASSERT_EQ(ELOOP, errno);
+  ASSERT_TRUE(android::base::ReadFileToString(link.path, &s, true));
+  ASSERT_EQ("foo", s);
+}
+#endif
+
 // WriteStringToFile2 is explicitly for setting Unix permissions, which make no
 // sense on Windows.
 #if !defined(_WIN32)
@@ -109,4 +127,58 @@ TEST(file, RemoveFileIfExist) {
   ASSERT_FALSE(android::base::RemoveFileIfExists(td.path));
   ASSERT_FALSE(android::base::RemoveFileIfExists(td.path, &err));
   ASSERT_EQ("is not a regular or symbol link file", err);
+}
+
+TEST(file, Readlink) {
+#if !defined(_WIN32)
+  // Linux doesn't allow empty symbolic links.
+  std::string min("x");
+  // ext2 and ext4 both have PAGE_SIZE limits.
+  // If file encryption is enabled, there's extra overhead to store the
+  // size of the encrypted symlink target. There's also an off-by-one
+  // in current kernels (and marlin/sailfish where we're seeing this
+  // failure are still on 3.18, far from current). http://b/33306057.
+  std::string max(static_cast<size_t>(4096 - 2 - 1 - 1), 'x');
+
+  TemporaryDir td;
+  std::string min_path{std::string(td.path) + "/" + "min"};
+  std::string max_path{std::string(td.path) + "/" + "max"};
+
+  ASSERT_EQ(0, symlink(min.c_str(), min_path.c_str()));
+  ASSERT_EQ(0, symlink(max.c_str(), max_path.c_str()));
+
+  std::string result;
+
+  result = "wrong";
+  ASSERT_TRUE(android::base::Readlink(min_path, &result));
+  ASSERT_EQ(min, result);
+
+  result = "wrong";
+  ASSERT_TRUE(android::base::Readlink(max_path, &result));
+  ASSERT_EQ(max, result);
+#endif
+}
+
+TEST(file, GetExecutableDirectory) {
+  std::string path = android::base::GetExecutableDirectory();
+  ASSERT_NE("", path);
+  ASSERT_NE(android::base::GetExecutablePath(), path);
+  ASSERT_EQ('/', path[0]);
+  ASSERT_NE('/', path[path.size() - 1]);
+}
+
+TEST(file, GetExecutablePath) {
+  ASSERT_NE("", android::base::GetExecutablePath());
+}
+
+TEST(file, Basename) {
+  EXPECT_EQ("sh", android::base::Basename("/system/bin/sh"));
+  EXPECT_EQ("sh", android::base::Basename("sh"));
+  EXPECT_EQ("sh", android::base::Basename("/system/bin/sh/"));
+}
+
+TEST(file, Dirname) {
+  EXPECT_EQ("/system/bin", android::base::Dirname("/system/bin/sh"));
+  EXPECT_EQ(".", android::base::Dirname("sh"));
+  EXPECT_EQ("/system/bin", android::base::Dirname("/system/bin/sh/"));
 }

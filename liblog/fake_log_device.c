@@ -25,10 +25,14 @@
 #if !defined(_WIN32)
 #include <pthread.h>
 #endif
+#include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#include <log/logd.h>
+#include <android/log.h>
+#include <log/uio.h>
 
 #include "fake_log_device.h"
 #include "log_portability.h"
@@ -608,7 +612,12 @@ static ssize_t logWritev(int fd, const struct iovec* vector, int count)
 
 bail:
     unlock();
-    return vector[0].iov_len + vector[1].iov_len + vector[2].iov_len;
+    int len = 0;
+    for (i = 0; i < count; ++i) {
+       len += vector[i].iov_len;
+    }
+    return len;
+
 error:
     unlock();
     return -1;
@@ -711,10 +720,30 @@ LIBLOG_HIDDEN ssize_t fakeLogWritev(int fd,
     return redirectWritev(fd, vector, count);
 }
 
+LIBLOG_HIDDEN ssize_t __send_log_msg(char *buf __unused,
+                                     size_t buf_size __unused)
+{
+    return -ENODEV;
+}
+
 LIBLOG_ABI_PUBLIC int __android_log_is_loggable(int prio,
                                                 const char *tag __unused,
                                                 int def)
 {
     int logLevel = def;
     return logLevel >= 0 && prio >= logLevel;
+}
+
+LIBLOG_ABI_PUBLIC int __android_log_is_loggable_len(int prio,
+                                                    const char *tag __unused,
+                                                    size_t len __unused,
+                                                    int def)
+{
+    int logLevel = def;
+    return logLevel >= 0 && prio >= logLevel;
+}
+
+LIBLOG_ABI_PRIVATE int __android_log_is_debuggable()
+{
+    return 1;
 }

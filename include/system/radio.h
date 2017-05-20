@@ -84,7 +84,7 @@ typedef enum {
 typedef unsigned int radio_handle_t;
 
 /* Opaque meta data structure used by radio meta data API (see system/radio_metadata.h) */
-typedef struct radio_medtadata radio_metadata_t;
+typedef struct radio_metadata radio_metadata_t;
 
 
 /* Additional attributes for an FM band configuration */
@@ -170,7 +170,8 @@ typedef struct radio_program_info {
     bool             stereo;    /* program is stereo or not */
     bool             digital;   /* digital program or not (e.g HD Radio program) */
     unsigned int     signal_strength; /* signal strength from 0 to 100 */
-    radio_metadata_t *metadata; /* non null if meta data are present (e.g PTY, song title ...) */
+                                /* meta data (e.g PTY, song title ...), must not be NULL */
+    __attribute__((aligned(8))) radio_metadata_t *metadata;
 } radio_program_info_t;
 
 
@@ -218,7 +219,8 @@ typedef struct radio_event {
 } radio_event_t;
 
 
-static radio_rds_t radio_rds_for_region(bool rds, radio_region_t region) {
+static inline
+radio_rds_t radio_rds_for_region(bool rds, radio_region_t region) {
     if (!rds)
         return RADIO_RDS_NONE;
     switch(region) {
@@ -234,7 +236,8 @@ static radio_rds_t radio_rds_for_region(bool rds, radio_region_t region) {
     }
 }
 
-static radio_deemphasis_t radio_demephasis_for_region(radio_region_t region) {
+static inline
+radio_deemphasis_t radio_demephasis_for_region(radio_region_t region) {
     switch(region) {
         case RADIO_REGION_KOREA:
         case RADIO_REGION_ITU_2:

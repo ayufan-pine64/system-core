@@ -38,8 +38,17 @@ __BEGIN_DECLS
 
 /*****************************************************************************/
 
+#ifdef __cplusplus
+#define ANDROID_NATIVE_UNSIGNED_CAST(x) static_cast<unsigned int>(x)
+#else
+#define ANDROID_NATIVE_UNSIGNED_CAST(x) ((unsigned int)(x))
+#endif
+
 #define ANDROID_NATIVE_MAKE_CONSTANT(a,b,c,d) \
-    (((unsigned)(a)<<24)|((unsigned)(b)<<16)|((unsigned)(c)<<8)|(unsigned)(d))
+    ((ANDROID_NATIVE_UNSIGNED_CAST(a) << 24) | \
+     (ANDROID_NATIVE_UNSIGNED_CAST(b) << 16) | \
+     (ANDROID_NATIVE_UNSIGNED_CAST(c) << 8) | \
+     (ANDROID_NATIVE_UNSIGNED_CAST(d)))
 
 #define ANDROID_NATIVE_WINDOW_MAGIC \
     ANDROID_NATIVE_MAKE_CONSTANT('_','w','n','d')
@@ -278,6 +287,16 @@ enum {
      * age will be 0.
      */
     NATIVE_WINDOW_BUFFER_AGE = 13,
+
+    /*
+     * Returns the duration of the last dequeueBuffer call in microseconds
+     */
+    NATIVE_WINDOW_LAST_DEQUEUE_DURATION = 14,
+
+    /*
+     * Returns the duration of the last queueBuffer call in microseconds
+     */
+    NATIVE_WINDOW_LAST_QUEUE_DURATION = 15,
 };
 
 /* Valid operations for the (*perform)() hook.
@@ -314,6 +333,7 @@ enum {
     NATIVE_WINDOW_SET_SURFACE_DAMAGE        = 20,   /* private */
     NATIVE_WINDOW_SET_SHARED_BUFFER_MODE    = 21,
     NATIVE_WINDOW_SET_AUTO_REFRESH          = 22,
+    NATIVE_WINDOW_GET_FRAME_TIMESTAMPS      = 23,
 };
 
 /* parameter for NATIVE_WINDOW_[API_][DIS]CONNECT */
@@ -975,6 +995,18 @@ static inline int native_window_set_auto_refresh(
 {
     return window->perform(window, NATIVE_WINDOW_SET_AUTO_REFRESH, autoRefresh);
 }
+
+static inline int native_window_get_frame_timestamps(
+        struct ANativeWindow* window, uint32_t framesAgo,
+        int64_t* outPostedTime, int64_t* outAcquireTime,
+        int64_t* outRefreshStartTime, int64_t* outGlCompositionDoneTime,
+        int64_t* outDisplayRetireTime, int64_t* outReleaseTime)
+{
+    return window->perform(window, NATIVE_WINDOW_GET_FRAME_TIMESTAMPS,
+            framesAgo, outPostedTime, outAcquireTime, outRefreshStartTime,
+            outGlCompositionDoneTime, outDisplayRetireTime, outReleaseTime);
+}
+
 
 __END_DECLS
 

@@ -17,9 +17,11 @@
 #ifndef _LOGD_LOG_UTILS_H__
 #define _LOGD_LOG_UTILS_H__
 
+#include <sys/cdefs.h>
 #include <sys/types.h>
 
-#include <log/log.h>
+#include <utils/FastStrcmp.h>
+#include <private/android_logger.h>
 #include <sysutils/SocketClient.h>
 
 // Hijack this header as a common include file used by most all sources
@@ -29,13 +31,20 @@ namespace android {
 
 // Furnished in main.cpp. Caller must own and free returned value
 char *uidToName(uid_t uid);
+void prdebug(const char *fmt, ...) __printflike(1, 2);
 
-// Furnished in LogStatistics.cpp. Caller must own and free returned value
+// Furnished in LogStatistics.cpp.
+size_t sizesTotal();
+// Caller must own and free returned value
 char *pidToName(pid_t pid);
 char *tidToName(pid_t tid);
 
-// Furnished in main.cpp. Thread safe.
+// Furnished in LogTags.cpp. Thread safe.
 const char *tagToName(uint32_t tag);
+void ReReadEventLogTags();
+
+// Furnished by LogKlog.cpp.
+const char* strnstr(const char* s, size_t len, const char* needle);
 
 }
 
@@ -43,35 +52,9 @@ const char *tagToName(uint32_t tag);
 bool clientHasLogCredentials(uid_t uid, gid_t gid, pid_t pid);
 bool clientHasLogCredentials(SocketClient *cli);
 
-// Furnished in main.cpp
-#define BOOL_DEFAULT_FLAG_TRUE_FALSE 0x1
-#define BOOL_DEFAULT_FALSE       0x0     // false if property not present
-#define BOOL_DEFAULT_TRUE        0x1     // true if property not present
-#define BOOL_DEFAULT_FLAG_PERSIST    0x2 // <key>, persist.<key>, ro.<key>
-#define BOOL_DEFAULT_FLAG_ENG        0x4 // off for user
-#define BOOL_DEFAULT_FLAG_SVELTE     0x8 // off for low_ram
-
-bool property_get_bool(const char *key, int def);
-
 static inline bool worstUidEnabledForLogid(log_id_t id) {
-    return (id == LOG_ID_MAIN) || (id == LOG_ID_SYSTEM) || (id == LOG_ID_RADIO);
-}
-
-template <int (*cmp)(const char *l, const char *r, const size_t s)>
-static inline int fast(const char *l, const char *r, const size_t s) {
-    return (*l != *r) || cmp(l + 1, r + 1, s - 1);
-}
-
-template <int (*cmp)(const void *l, const void *r, const size_t s)>
-static inline int fast(const void *lv, const void *rv, const size_t s) {
-    const char *l = static_cast<const char *>(lv);
-    const char *r = static_cast<const char *>(rv);
-    return (*l != *r) || cmp(l + 1, r + 1, s - 1);
-}
-
-template <int (*cmp)(const char *l, const char *r)>
-static inline int fast(const char *l, const char *r) {
-    return (*l != *r) || cmp(l + 1, r + 1);
+    return (id == LOG_ID_MAIN) || (id == LOG_ID_SYSTEM) ||
+            (id == LOG_ID_RADIO) || (id == LOG_ID_EVENTS);
 }
 
 #endif // _LOGD_LOG_UTILS_H__

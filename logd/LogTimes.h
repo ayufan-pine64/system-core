@@ -23,8 +23,8 @@
 
 #include <list>
 
-#include <sysutils/SocketClient.h>
 #include <log/log.h>
+#include <sysutils/SocketClient.h>
 
 class LogReader;
 class LogBufferElement;

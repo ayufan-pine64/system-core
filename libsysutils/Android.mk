@@ -17,9 +17,11 @@ LOCAL_MODULE:= libsysutils
 LOCAL_CFLAGS := -Werror
 
 LOCAL_SHARED_LIBRARIES := \
+        libbase \
         libcutils \
         liblog \
         libnl
 
-include $(BUILD_SHARED_LIBRARY)
+LOCAL_EXPORT_C_INCLUDE_DIRS := system/core/libsysutils/include
 
+include $(BUILD_SHARED_LIBRARY)

@@ -17,6 +17,7 @@
 #include "util.h"
 
 #include <errno.h>
+
 #include <gtest/gtest.h>
 
 TEST(util, read_file_ENOENT) {

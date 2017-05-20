@@ -22,12 +22,12 @@
 #include <list>
 #include <string>
 
-#include <log/log.h>
+#include <android/log.h>
+#include <private/android_filesystem_config.h>
 #include <sysutils/SocketClient.h>
 
-#include <private/android_filesystem_config.h>
-
 #include "LogBufferElement.h"
+#include "LogTags.h"
 #include "LogTimes.h"
 #include "LogStatistics.h"
 #include "LogWhiteBlackList.h"
@@ -89,7 +89,7 @@ class LogBuffer {
     typedef std::unordered_map<uid_t,
                                LogBufferElementCollection::iterator>
                 LogBufferIteratorMap;
-    LogBufferIteratorMap mLastWorstUid[LOG_ID_MAX];
+    LogBufferIteratorMap mLastWorst[LOG_ID_MAX];
     // watermark of any worst/chatty pid of system processing
     typedef std::unordered_map<pid_t,
                                LogBufferElementCollection::iterator>
@@ -100,10 +100,17 @@ class LogBuffer {
 
     bool monotonic;
 
+    LogTags tags;
+
+    LogBufferElement* lastLoggedElements[LOG_ID_MAX];
+    LogBufferElement* droppedElements[LOG_ID_MAX];
+    void log(LogBufferElement* elem);
+
 public:
     LastLogTimes &mTimes;
 
-    LogBuffer(LastLogTimes *times);
+    explicit LogBuffer(LastLogTimes *times);
+    ~LogBuffer();
     void init();
     bool isMonotonic() { return monotonic; }
 
@@ -119,7 +126,7 @@ public:
     unsigned long getSize(log_id_t id);
     int setSize(log_id_t id, unsigned long size);
     unsigned long getSizeUsed(log_id_t id);
-    // *strp uses malloc, use free to release.
+
     std::string formatStatistics(uid_t uid, pid_t pid, unsigned int logMask);
 
     void enableStatistics() {
@@ -128,6 +135,15 @@ public:
 
     int initPrune(const char *cp) { return mPrune.init(cp); }
     std::string formatPrune() { return mPrune.format(); }
+
+    std::string formatGetEventTag(uid_t uid,
+                                  const char *name, const char *format) {
+        return tags.formatGetEventTag(uid, name, format);
+    }
+    std::string formatEntry(uint32_t tag, uid_t uid) {
+        return tags.formatEntry(tag, uid);
+    }
+    const char *tagToName(uint32_t tag) { return tags.tagToName(tag); }
 
     // helper must be protected directly or implicitly by lock()/unlock()
     const char *pidToName(pid_t pid) { return stats.pidToName(pid); }

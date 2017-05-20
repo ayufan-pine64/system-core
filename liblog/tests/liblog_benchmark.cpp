@@ -15,15 +15,19 @@
  */
 
 #include <fcntl.h>
+#include <inttypes.h>
+#include <poll.h>
 #include <sys/endian.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <unordered_set>
+
+#include <android-base/file.h>
 #include <cutils/sockets.h>
-#include <log/log.h>
-#include <log/logger.h>
-#include <log/log_read.h>
+#include <log/event_tag_map.h>
+#include <log/log_frontend.h>
 #include <private/android_logger.h>
 
 #include "benchmark.h"
@@ -77,10 +81,29 @@ static void BM_log_maximum(int iters) {
 }
 BENCHMARK(BM_log_maximum);
 
+static void set_log_null() {
+    android_set_log_frontend(LOGGER_NULL);
+}
+
+static void set_log_default() {
+    android_set_log_frontend(LOGGER_DEFAULT);
+}
+
+static void BM_log_maximum_null(int iters) {
+    set_log_null();
+    BM_log_maximum(iters);
+    set_log_default();
+}
+BENCHMARK(BM_log_maximum_null);
+
 /*
- *	Measure the time it takes to submit the android logging call using
- * discrete acquisition under light load. Expect this to be a pair of
- * syscall periods (2us).
+ *	Measure the time it takes to collect the time using
+ * discrete acquisition (StartBenchmarkTiming() -> StopBenchmarkTiming())
+ * under light load. Expect this to be a syscall period (2us) or
+ * data read time if zero-syscall.
+ *
+ * vdso support in the kernel and the library can allow
+ * clock_gettime to be zero-syscall.
  */
 static void BM_clock_overhead(int iters) {
     for (int i = 0; i < iters; ++i) {
@@ -205,7 +228,7 @@ static void BM_pmsg_short_aligned(int iters) {
         android_log_header_t header;
         android_log_event_int_t payload;
     };
-    char buf[sizeof(struct packet) + 8] __aligned(8);
+    alignas(8) char buf[sizeof(struct packet) + 8];
     memset(buf, 0, sizeof(buf));
     struct packet *buffer = (struct packet*)(((uintptr_t)buf + 7) & ~7);
     if (((uintptr_t)&buffer->pmsg_header) & 7) {
@@ -281,7 +304,7 @@ static void BM_pmsg_short_unaligned1(int iters) {
         android_log_header_t header;
         android_log_event_int_t payload;
     };
-    char buf[sizeof(struct packet) + 8] __aligned(8);
+    alignas(8) char buf[sizeof(struct packet) + 8];
     memset(buf, 0, sizeof(buf));
     struct packet *buffer = (struct packet*)((((uintptr_t)buf + 7) & ~7) + 1);
     if ((((uintptr_t)&buffer->pmsg_header) & 7) != 1) {
@@ -357,7 +380,7 @@ static void BM_pmsg_long_aligned(int iters) {
         android_log_header_t header;
         android_log_event_int_t payload;
     };
-    char buf[sizeof(struct packet) + 8 + LOGGER_ENTRY_MAX_PAYLOAD] __aligned(8);
+    alignas(8) char buf[sizeof(struct packet) + 8 + LOGGER_ENTRY_MAX_PAYLOAD];
     memset(buf, 0, sizeof(buf));
     struct packet *buffer = (struct packet*)(((uintptr_t)buf + 7) & ~7);
     if (((uintptr_t)&buffer->pmsg_header) & 7) {
@@ -430,7 +453,7 @@ static void BM_pmsg_long_unaligned1(int iters) {
         android_log_header_t header;
         android_log_event_int_t payload;
     };
-    char buf[sizeof(struct packet) + 8 + LOGGER_ENTRY_MAX_PAYLOAD] __aligned(8);
+    alignas(8) char buf[sizeof(struct packet) + 8 + LOGGER_ENTRY_MAX_PAYLOAD];
     memset(buf, 0, sizeof(buf));
     struct packet *buffer = (struct packet*)((((uintptr_t)buf + 7) & ~7) + 1);
     if ((((uintptr_t)&buffer->pmsg_header) & 7) != 1) {
@@ -465,19 +488,94 @@ static void BM_pmsg_long_unaligned1(int iters) {
 BENCHMARK(BM_pmsg_long_unaligned1);
 
 /*
- *	Measure the time it takes to submit the android logging call using
- * discrete acquisition under light load. Expect this to be a dozen or so
- * syscall periods (40us).
+ *	Measure the time it takes to form sprintf plus time using
+ * discrete acquisition (StartBenchmarkTiming() -> StopBenchmarkTiming())
+ * under light load. Expect this to be a syscall period (2us) or sprintf
+ * time if zero-syscall time.
  */
-static void BM_log_overhead(int iters) {
+/* helper function */
+static void test_print(const char *fmt, ...) {
+    va_list ap;
+    char buf[1024];
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+}
+
+#define logd_yield() sched_yield() // allow logd to catch up
+#define logd_sleep() usleep(50)    // really allow logd to catch up
+
+/* performance test */
+static void BM_sprintf_overhead(int iters) {
+    for (int i = 0; i < iters; ++i) {
+       StartBenchmarkTiming();
+       test_print("BM_sprintf_overhead:%d", i);
+       StopBenchmarkTiming();
+       logd_yield();
+    }
+}
+BENCHMARK(BM_sprintf_overhead);
+
+/*
+ *	Measure the time it takes to submit the android printing logging call
+ * using discrete acquisition discrete acquisition (StartBenchmarkTiming() ->
+ * StopBenchmarkTiming()) under light load. Expect this to be a dozen or so
+ * syscall periods (40us) plus time to run *printf
+ */
+static void BM_log_print_overhead(int iters) {
     for (int i = 0; i < iters; ++i) {
        StartBenchmarkTiming();
        __android_log_print(ANDROID_LOG_INFO, "BM_log_overhead", "%d", i);
        StopBenchmarkTiming();
-       usleep(1000);
+       logd_yield();
     }
 }
-BENCHMARK(BM_log_overhead);
+BENCHMARK(BM_log_print_overhead);
+
+/*
+ *	Measure the time it takes to submit the android event logging call
+ * using discrete acquisition (StartBenchmarkTiming() -> StopBenchmarkTiming())
+ * under light load. Expect this to be a dozen or so syscall periods (40us)
+ */
+static void BM_log_event_overhead(int iters) {
+    for (unsigned long long i = 0; i < (unsigned)iters; ++i) {
+       StartBenchmarkTiming();
+       __android_log_btwrite(0, EVENT_TYPE_LONG, &i, sizeof(i));
+       StopBenchmarkTiming();
+       logd_yield();
+    }
+}
+BENCHMARK(BM_log_event_overhead);
+
+static void BM_log_event_overhead_null(int iters) {
+    set_log_null();
+    BM_log_event_overhead(iters);
+    set_log_default();
+}
+BENCHMARK(BM_log_event_overhead_null);
+
+/*
+ *	Measure the time it takes to submit the android event logging call
+ * using discrete acquisition (StartBenchmarkTiming() -> StopBenchmarkTiming())
+ * under very-light load (<1% CPU utilization).
+ */
+static void BM_log_light_overhead(int iters) {
+    for (unsigned long long i = 0; i < (unsigned)iters; ++i) {
+       StartBenchmarkTiming();
+       __android_log_btwrite(0, EVENT_TYPE_LONG, &i, sizeof(i));
+       StopBenchmarkTiming();
+       usleep(10000);
+    }
+}
+BENCHMARK(BM_log_light_overhead);
+
+static void BM_log_light_overhead_null(int iters) {
+    set_log_null();
+    BM_log_light_overhead(iters);
+    set_log_default();
+}
+BENCHMARK(BM_log_light_overhead_null);
 
 static void caught_latency(int /*signum*/)
 {
@@ -542,7 +640,7 @@ static void BM_log_latency(int iters) {
 
             char* eventData = log_msg.msg();
 
-            if (eventData[4] != EVENT_TYPE_LONG) {
+            if (!eventData || (eventData[4] != EVENT_TYPE_LONG)) {
                 continue;
             }
             log_time tx(eventData + 4 + 1);
@@ -622,7 +720,7 @@ static void BM_log_delay(int iters) {
 
             char* eventData = log_msg.msg();
 
-            if (eventData[4] != EVENT_TYPE_LONG) {
+            if (!eventData || (eventData[4] != EVENT_TYPE_LONG)) {
                 continue;
             }
             log_time tx(eventData + 4 + 1);
@@ -651,10 +749,14 @@ BENCHMARK(BM_log_delay);
  *	Measure the time it takes for __android_log_is_loggable.
  */
 static void BM_is_loggable(int iters) {
+    static const char logd[] = "logd";
+
     StartBenchmarkTiming();
 
     for (int i = 0; i < iters; ++i) {
-        __android_log_is_loggable(ANDROID_LOG_WARN, "logd", ANDROID_LOG_VERBOSE);
+        __android_log_is_loggable_len(ANDROID_LOG_WARN,
+                                      logd, strlen(logd),
+                                      ANDROID_LOG_VERBOSE);
     }
 
     StopBenchmarkTiming();
@@ -688,3 +790,235 @@ static void BM_security(int iters) {
     StopBenchmarkTiming();
 }
 BENCHMARK(BM_security);
+
+// Keep maps around for multiple iterations
+static std::unordered_set<uint32_t> set;
+static EventTagMap* map;
+
+static bool prechargeEventMap() {
+    if (map) return true;
+
+    fprintf(stderr, "Precharge: start\n");
+
+    map = android_openEventTagMap(NULL);
+    for (uint32_t tag = 1; tag < USHRT_MAX; ++tag) {
+        size_t len;
+        if (android_lookupEventTag_len(map, &len, tag) == NULL) continue;
+        set.insert(tag);
+    }
+
+    fprintf(stderr, "Precharge: stop %zu\n", set.size());
+
+    return true;
+}
+
+/*
+ *	Measure the time it takes for android_lookupEventTag_len
+ */
+static void BM_lookupEventTag(int iters) {
+
+    prechargeEventMap();
+
+    std::unordered_set<uint32_t>::const_iterator it = set.begin();
+
+    StartBenchmarkTiming();
+
+    for (int i = 0; i < iters; ++i) {
+        size_t len;
+        android_lookupEventTag_len(map, &len, (*it));
+        ++it;
+        if (it == set.end()) it = set.begin();
+    }
+
+    StopBenchmarkTiming();
+}
+BENCHMARK(BM_lookupEventTag);
+
+/*
+ *	Measure the time it takes for android_lookupEventTag_len
+ */
+static uint32_t notTag = 1;
+
+static void BM_lookupEventTag_NOT(int iters) {
+
+    prechargeEventMap();
+
+    while (set.find(notTag) != set.end()) {
+        ++notTag;
+        if (notTag >= USHRT_MAX) notTag = 1;
+    }
+
+    StartBenchmarkTiming();
+
+    for (int i = 0; i < iters; ++i) {
+        size_t len;
+        android_lookupEventTag_len(map, &len, notTag);
+    }
+
+    StopBenchmarkTiming();
+
+    ++notTag;
+    if (notTag >= USHRT_MAX) notTag = 1;
+}
+BENCHMARK(BM_lookupEventTag_NOT);
+
+/*
+ *	Measure the time it takes for android_lookupEventFormat_len
+ */
+static void BM_lookupEventFormat(int iters) {
+
+    prechargeEventMap();
+
+    std::unordered_set<uint32_t>::const_iterator it = set.begin();
+
+    StartBenchmarkTiming();
+
+    for (int i = 0; i < iters; ++i) {
+        size_t len;
+        android_lookupEventFormat_len(map, &len, (*it));
+        ++it;
+        if (it == set.end()) it = set.begin();
+    }
+
+    StopBenchmarkTiming();
+}
+BENCHMARK(BM_lookupEventFormat);
+
+/*
+ *	Measure the time it takes for android_lookupEventTagNum plus above
+ */
+static void BM_lookupEventTagNum(int iters) {
+
+    prechargeEventMap();
+
+    std::unordered_set<uint32_t>::const_iterator it = set.begin();
+
+    for (int i = 0; i < iters; ++i) {
+        size_t len;
+        const char* name = android_lookupEventTag_len(map, &len, (*it));
+        std::string Name(name, len);
+        const char* format = android_lookupEventFormat_len(map, &len, (*it));
+        std::string Format(format, len);
+        StartBenchmarkTiming();
+        android_lookupEventTagNum(map, Name.c_str(), Format.c_str(),
+                                  ANDROID_LOG_UNKNOWN);
+        StopBenchmarkTiming();
+        ++it;
+        if (it == set.end()) it = set.begin();
+    }
+
+}
+BENCHMARK(BM_lookupEventTagNum);
+
+// Must be functionally identical to liblog internal __send_log_msg.
+static void send_to_control(char *buf, size_t len)
+{
+    int sock = socket_local_client("logd",
+                                   ANDROID_SOCKET_NAMESPACE_RESERVED,
+                                   SOCK_STREAM);
+    if (sock < 0) return;
+    size_t writeLen = strlen(buf) + 1;
+
+    ssize_t ret = TEMP_FAILURE_RETRY(write(sock, buf, writeLen));
+    if (ret <= 0) {
+        close(sock);
+        return;
+    }
+    while ((ret = read(sock, buf, len)) > 0) {
+        if (((size_t)ret == len) || (len < PAGE_SIZE)) {
+            break;
+        }
+        len -= ret;
+        buf += ret;
+
+        struct pollfd p = {
+            .fd = sock,
+            .events = POLLIN,
+            .revents = 0
+        };
+
+        ret = poll(&p, 1, 20);
+        if ((ret <= 0) || !(p.revents & POLLIN)) {
+            break;
+        }
+    }
+    close(sock);
+}
+
+static void BM_lookupEventTagNum_logd_new(int iters) {
+    fprintf(stderr, "WARNING: "
+            "This test can cause logd to grow in size and hit DOS limiter\n");
+    // Make copies
+    static const char empty_event_log_tags[] = "# content owned by logd\n";
+    static const char dev_event_log_tags_path[] = "/dev/event-log-tags";
+    std::string dev_event_log_tags;
+    if (android::base::ReadFileToString(dev_event_log_tags_path,
+                                        &dev_event_log_tags) &&
+            (dev_event_log_tags.length() == 0)) {
+        dev_event_log_tags = empty_event_log_tags;
+    }
+    static const char data_event_log_tags_path[] = "/data/misc/logd/event-log-tags";
+    std::string data_event_log_tags;
+    if (android::base::ReadFileToString(data_event_log_tags_path,
+                                        &data_event_log_tags) &&
+            (data_event_log_tags.length() == 0)) {
+        data_event_log_tags = empty_event_log_tags;
+    }
+
+    for (int i = 0; i < iters; ++i) {
+        char buffer[256];
+        memset(buffer, 0, sizeof(buffer));
+        log_time now(CLOCK_MONOTONIC);
+        char name[64];
+        snprintf(name, sizeof(name), "a%" PRIu64, now.nsec());
+        snprintf(buffer, sizeof(buffer),
+                 "getEventTag name=%s format=\"(new|1)\"", name);
+        StartBenchmarkTiming();
+        send_to_control(buffer, sizeof(buffer));
+        StopBenchmarkTiming();
+    }
+
+    // Restore copies (logd still know about them, until crash or reboot)
+    if (dev_event_log_tags.length() &&
+            !android::base::WriteStringToFile(dev_event_log_tags,
+                                              dev_event_log_tags_path)) {
+        fprintf(stderr, "WARNING: "
+                "failed to restore %s\n", dev_event_log_tags_path);
+    }
+    if (data_event_log_tags.length() &&
+            !android::base::WriteStringToFile(data_event_log_tags,
+                                              data_event_log_tags_path)) {
+        fprintf(stderr, "WARNING: "
+                "failed to restore %s\n", data_event_log_tags_path);
+    }
+    fprintf(stderr, "WARNING: "
+            "Restarting logd to make it forget what we just did\n");
+    system("stop logd ; start logd");
+}
+BENCHMARK(BM_lookupEventTagNum_logd_new);
+
+static void BM_lookupEventTagNum_logd_existing(int iters) {
+    prechargeEventMap();
+
+    std::unordered_set<uint32_t>::const_iterator it = set.begin();
+
+    for (int i = 0; i < iters; ++i) {
+        size_t len;
+        const char* name = android_lookupEventTag_len(map, &len, (*it));
+        std::string Name(name, len);
+        const char* format = android_lookupEventFormat_len(map, &len, (*it));
+        std::string Format(format, len);
+
+        char buffer[256];
+        snprintf(buffer, sizeof(buffer),
+                 "getEventTag name=%s format=\"%s\"",
+                 Name.c_str(), Format.c_str());
+
+        StartBenchmarkTiming();
+        send_to_control(buffer, sizeof(buffer));
+        StopBenchmarkTiming();
+        ++it;
+        if (it == set.end()) it = set.begin();
+    }
+}
+BENCHMARK(BM_lookupEventTagNum_logd_existing);

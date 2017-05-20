@@ -26,8 +26,11 @@
 #include <vector>
 
 #include "action.h"
+#include "capabilities.h"
+#include "descriptors.h"
 #include "init_parser.h"
 #include "keyword_map.h"
+#include "util.h"
 
 #define SVC_DISABLED       0x001  // do not autostart with class
 #define SVC_ONESHOT        0x002  // do not restart on exit
@@ -47,18 +50,6 @@
 class Action;
 class ServiceManager;
 
-struct SocketInfo {
-    SocketInfo();
-    SocketInfo(const std::string& name, const std::string& type, uid_t uid,
-                       gid_t gid, int perm, const std::string& socketcon);
-    std::string name;
-    std::string type;
-    uid_t uid;
-    gid_t gid;
-    int perm;
-    std::string socketcon;
-};
-
 struct ServiceEnvironmentInfo {
     ServiceEnvironmentInfo();
     ServiceEnvironmentInfo(const std::string& name, const std::string& value);
@@ -72,10 +63,12 @@ public:
             const std::vector<std::string>& args);
 
     Service(const std::string& name, const std::string& classname,
-            unsigned flags, uid_t uid, gid_t gid, const std::vector<gid_t>& supp_gids,
-            const std::string& seclabel,  const std::vector<std::string>& args);
+            unsigned flags, uid_t uid, gid_t gid,
+            const std::vector<gid_t>& supp_gids, const CapSet& capabilities,
+            unsigned namespace_flags, const std::string& seclabel,
+            const std::vector<std::string>& args);
 
-    bool HandleLine(const std::vector<std::string>& args, std::string* err);
+    bool ParseLine(const std::vector<std::string>& args, std::string* err);
     bool Start();
     bool StartIfNotDisabled();
     bool Enable();
@@ -83,7 +76,7 @@ public:
     void Stop();
     void Terminate();
     void Restart();
-    void RestartIfNeeded(time_t& process_needs_restart);
+    void RestartIfNeeded(time_t* process_needs_restart_at);
     bool Reap();
     void DumpState() const;
 
@@ -93,6 +86,7 @@ public:
     pid_t pid() const { return pid_; }
     uid_t uid() const { return uid_; }
     gid_t gid() const { return gid_; }
+    int priority() const { return priority_; }
     const std::vector<gid_t>& supp_gids() const { return supp_gids_; }
     const std::string& seclabel() const { return seclabel_; }
     const std::vector<int>& keycodes() const { return keycodes_; }
@@ -101,47 +95,59 @@ public:
     const std::vector<std::string>& args() const { return args_; }
 
 private:
-    using OptionHandler = bool (Service::*) (const std::vector<std::string>& args,
-                                             std::string* err);
-    class OptionHandlerMap;
+    using OptionParser = bool (Service::*) (const std::vector<std::string>& args,
+                                            std::string* err);
+    class OptionParserMap;
 
     void NotifyStateChange(const std::string& new_state) const;
     void StopOrReset(int how);
     void ZapStdio() const;
     void OpenConsole() const;
-    void PublishSocket(const std::string& name, int fd) const;
+    void KillProcessGroup(int signal);
+    void SetProcessAttributes();
 
-    bool HandleClass(const std::vector<std::string>& args, std::string* err);
-    bool HandleConsole(const std::vector<std::string>& args, std::string* err);
-    bool HandleCritical(const std::vector<std::string>& args, std::string* err);
-    bool HandleDisabled(const std::vector<std::string>& args, std::string* err);
-    bool HandleGroup(const std::vector<std::string>& args, std::string* err);
-    bool HandleIoprio(const std::vector<std::string>& args, std::string* err);
-    bool HandleKeycodes(const std::vector<std::string>& args, std::string* err);
-    bool HandleOneshot(const std::vector<std::string>& args, std::string* err);
-    bool HandleOnrestart(const std::vector<std::string>& args, std::string* err);
-    bool HandleSeclabel(const std::vector<std::string>& args, std::string* err);
-    bool HandleSetenv(const std::vector<std::string>& args, std::string* err);
-    bool HandleSocket(const std::vector<std::string>& args, std::string* err);
-    bool HandleUser(const std::vector<std::string>& args, std::string* err);
-    bool HandleWritepid(const std::vector<std::string>& args, std::string* err);
+    bool ParseCapabilities(const std::vector<std::string>& args, std::string *err);
+    bool ParseClass(const std::vector<std::string>& args, std::string* err);
+    bool ParseConsole(const std::vector<std::string>& args, std::string* err);
+    bool ParseCritical(const std::vector<std::string>& args, std::string* err);
+    bool ParseDisabled(const std::vector<std::string>& args, std::string* err);
+    bool ParseGroup(const std::vector<std::string>& args, std::string* err);
+    bool ParsePriority(const std::vector<std::string>& args, std::string* err);
+    bool ParseIoprio(const std::vector<std::string>& args, std::string* err);
+    bool ParseKeycodes(const std::vector<std::string>& args, std::string* err);
+    bool ParseOneshot(const std::vector<std::string>& args, std::string* err);
+    bool ParseOnrestart(const std::vector<std::string>& args, std::string* err);
+    bool ParseOomScoreAdjust(const std::vector<std::string>& args, std::string* err);
+    bool ParseNamespace(const std::vector<std::string>& args, std::string* err);
+    bool ParseSeclabel(const std::vector<std::string>& args, std::string* err);
+    bool ParseSetenv(const std::vector<std::string>& args, std::string* err);
+    bool ParseSocket(const std::vector<std::string>& args, std::string* err);
+    bool ParseFile(const std::vector<std::string>& args, std::string* err);
+    bool ParseUser(const std::vector<std::string>& args, std::string* err);
+    bool ParseWritepid(const std::vector<std::string>& args, std::string* err);
+
+    template <typename T>
+    bool AddDescriptor(const std::vector<std::string>& args, std::string* err);
 
     std::string name_;
     std::string classname_;
+    std::string console_;
 
     unsigned flags_;
     pid_t pid_;
-    time_t time_started_;    // time of last start
-    time_t time_crashed_;    // first crash within inspection window
-    int nr_crashed_;         // number of times crashed within window
+    boot_clock::time_point time_started_; // time of last start
+    boot_clock::time_point time_crashed_; // first crash within inspection window
+    int crash_count_;                     // number of times crashed within window
 
     uid_t uid_;
     gid_t gid_;
     std::vector<gid_t> supp_gids_;
+    CapSet capabilities_;
+    unsigned namespace_flags_;
 
     std::string seclabel_;
 
-    std::vector<SocketInfo> sockets_;
+    std::vector<std::unique_ptr<DescriptorInfo>> descriptors_;
     std::vector<ServiceEnvironmentInfo> envvars_;
 
     Action onrestart_;  // Commands to execute on restart.
@@ -154,6 +160,9 @@ private:
 
     IoSchedClass ioprio_class_;
     int ioprio_pri_;
+    int priority_;
+
+    int oom_score_adjust_;
 
     std::vector<std::string> args_;
 };
@@ -167,7 +176,7 @@ public:
     Service* FindServiceByName(const std::string& name) const;
     Service* FindServiceByPid(pid_t pid) const;
     Service* FindServiceByKeychord(int keychord_id) const;
-    void ForEachService(std::function<void(Service*)> callback) const;
+    void ForEachService(const std::function<void(Service*)>& callback) const;
     void ForEachServiceInClass(const std::string& classname,
                                void (*func)(Service* svc)) const;
     void ForEachServiceWithFlags(unsigned matchflags,

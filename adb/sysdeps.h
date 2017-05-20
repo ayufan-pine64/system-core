@@ -34,6 +34,9 @@
 #include <android-base/unique_fd.h>
 #include <android-base/utf8.h>
 
+#include "sysdeps/errno.h"
+#include "sysdeps/stat.h"
+
 /*
  * TEMP_FAILURE_RETRY is defined by some, but not all, versions of
  * <unistd.h>. (Alas, it is not as standard as we'd hoped!) So, if it's
@@ -93,27 +96,6 @@
 
 static __inline__ bool adb_is_separator(char c) {
     return c == '\\' || c == '/';
-}
-
-typedef CRITICAL_SECTION          adb_mutex_t;
-
-#define  ADB_MUTEX_DEFINE(x)     adb_mutex_t   x
-
-/* declare all mutexes */
-/* For win32, adb_sysdeps_init() will do the mutex runtime initialization. */
-#define  ADB_MUTEX(x)   extern adb_mutex_t  x;
-#include "mutex_list.h"
-
-extern void  adb_sysdeps_init(void);
-
-static __inline__ void adb_mutex_lock( adb_mutex_t*  lock )
-{
-    EnterCriticalSection( lock );
-}
-
-static __inline__ void  adb_mutex_unlock( adb_mutex_t*  lock )
-{
-    LeaveCriticalSection( lock );
 }
 
 typedef void (*adb_thread_func_t)(void* arg);
@@ -199,10 +181,6 @@ static __inline__ void  close_on_exec(int  fd)
     /* nothing really */
 }
 
-#define  lstat    stat   /* no symlinks on Win32 */
-
-#define  S_ISLNK(m)   0   /* no symlinks on Win32 */
-
 extern int  adb_unlink(const char*  path);
 #undef  unlink
 #define unlink  ___xxx_unlink
@@ -269,17 +247,18 @@ extern int unix_open(const char* path, int options, ...);
 int unix_isatty(int fd);
 #define  isatty  ___xxx_isatty
 
-/* normally provided by <cutils/misc.h> */
-extern void*  load_file(const char*  pathname, unsigned*  psize);
-
-static __inline__ void  adb_sleep_ms( int  mseconds )
-{
-    Sleep( mseconds );
-}
-
 int network_loopback_client(int port, int type, std::string* error);
 int network_loopback_server(int port, int type, std::string* error);
 int network_inaddr_any_server(int port, int type, std::string* error);
+
+inline int network_local_client(const char* name, int namespace_id, int type, std::string* error) {
+    abort();
+}
+
+inline int network_local_server(const char* name, int namespace_id, int type, std::string* error) {
+    abort();
+}
+
 int network_connect(const std::string& host, int port, int type, int timeout,
                     std::string* error);
 
@@ -287,6 +266,13 @@ extern int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, socklen_t  
 
 #undef   accept
 #define  accept  ___xxx_accept
+
+int adb_getsockname(int fd, struct sockaddr* sockaddr, socklen_t* optlen);
+#undef getsockname
+#define getsockname(...) ___xxx_getsockname(__VA__ARGS__)
+
+// Returns the local port number of a bound socket, or -1 on failure.
+int adb_socket_get_local_port(int fd);
 
 extern int  adb_setsockopt(int  fd, int  level, int  optname, const void*  optval, socklen_t  optlen);
 
@@ -306,27 +292,6 @@ extern int adb_poll(adb_pollfd* fds, size_t nfds, int timeout);
 static __inline__ int adb_is_absolute_host_path(const char* path) {
     return isalpha(path[0]) && path[1] == ':' && path[2] == '\\';
 }
-
-// We later define a macro mapping 'stat' to 'adb_stat'. This causes:
-//   struct stat s;
-//   stat(filename, &s);
-// To turn into the following:
-//   struct adb_stat s;
-//   adb_stat(filename, &s);
-// To get this to work, we need to make 'struct adb_stat' the same as
-// 'struct stat'. Note that this definition of 'struct adb_stat' uses the
-// *current* macro definition of stat, so it may actually be inheriting from
-// struct _stat32i64 (or some other remapping).
-struct adb_stat : public stat {};
-
-static_assert(sizeof(struct adb_stat) == sizeof(struct stat),
-    "structures should be the same");
-
-extern int adb_stat(const char* f, struct adb_stat* s);
-
-// stat is already a macro, undefine it so we can redefine it.
-#undef stat
-#define stat adb_stat
 
 // UTF-8 versions of POSIX APIs.
 extern DIR* adb_opendir(const char* dirname);
@@ -397,9 +362,6 @@ inline void seekdir(DIR*, long) {
 
 #define getcwd adb_getcwd
 
-char* adb_strerror(int err);
-#define strerror adb_strerror
-
 // Helper class to convert UTF-16 argv from wmain() to UTF-8 args that can be
 // passed to main().
 class NarrowArgs {
@@ -455,7 +417,6 @@ size_t ParseCompleteUTF8(const char* first, const char* last, std::vector<char>*
 
 #else /* !_WIN32 a.k.a. Unix */
 
-#include <cutils/misc.h>
 #include <cutils/sockets.h>
 #include <cutils/threads.h>
 #include <fcntl.h>
@@ -484,27 +445,6 @@ size_t ParseCompleteUTF8(const char* first, const char* last, std::vector<char>*
 static __inline__ bool adb_is_separator(char c) {
     return c == '/';
 }
-
-typedef  pthread_mutex_t          adb_mutex_t;
-
-#define  ADB_MUTEX_INITIALIZER    PTHREAD_MUTEX_INITIALIZER
-#define  adb_mutex_init           pthread_mutex_init
-#define  adb_mutex_lock           pthread_mutex_lock
-#define  adb_mutex_unlock         pthread_mutex_unlock
-#define  adb_mutex_destroy        pthread_mutex_destroy
-
-#define  ADB_MUTEX_DEFINE(m)      adb_mutex_t   m = PTHREAD_MUTEX_INITIALIZER
-
-#define  adb_cond_t               pthread_cond_t
-#define  adb_cond_init            pthread_cond_init
-#define  adb_cond_wait            pthread_cond_wait
-#define  adb_cond_broadcast       pthread_cond_broadcast
-#define  adb_cond_signal          pthread_cond_signal
-#define  adb_cond_destroy         pthread_cond_destroy
-
-/* declare all mutexes */
-#define  ADB_MUTEX(x)   extern adb_mutex_t  x;
-#include "mutex_list.h"
 
 static __inline__ void  close_on_exec(int  fd)
 {
@@ -645,21 +585,26 @@ inline int _fd_set_error_str(int fd, std::string* error) {
 }
 
 inline int network_loopback_client(int port, int type, std::string* error) {
-  return _fd_set_error_str(socket_loopback_client(port, type), error);
+  return _fd_set_error_str(socket_network_client("localhost", port, type), error);
 }
 
 inline int network_loopback_server(int port, int type, std::string* error) {
-  return _fd_set_error_str(socket_loopback_server(port, type), error);
+  int fd = socket_loopback_server(port, type);
+  if (fd < 0 && errno == EAFNOSUPPORT)
+      return _fd_set_error_str(socket_loopback_server6(port, type), error);
+  return _fd_set_error_str(fd, error);
 }
 
 inline int network_inaddr_any_server(int port, int type, std::string* error) {
   return _fd_set_error_str(socket_inaddr_any_server(port, type), error);
 }
 
-inline int network_local_server(const char *name, int namespace_id, int type,
-                                std::string* error) {
-  return _fd_set_error_str(socket_local_server(name, namespace_id, type),
-                           error);
+inline int network_local_client(const char* name, int namespace_id, int type, std::string* error) {
+    return _fd_set_error_str(socket_local_client(name, namespace_id, type), error);
+}
+
+inline int network_local_server(const char* name, int namespace_id, int type, std::string* error) {
+    return _fd_set_error_str(socket_local_server(name, namespace_id, type), error);
 }
 
 inline int network_connect(const std::string& host, int port, int type,
@@ -691,6 +636,10 @@ static __inline__ int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, 
 
 #undef   accept
 #define  accept  ___xxx_accept
+
+inline int adb_socket_get_local_port(int fd) {
+    return socket_get_local_port(fd);
+}
 
 // Operate on a file descriptor returned from unix_open() or a well-known file
 // descriptor such as STDIN_FILENO, STDOUT_FILENO, STDERR_FILENO.
@@ -808,11 +757,6 @@ static __inline__ int adb_poll(adb_pollfd* fds, size_t nfds, int timeout) {
 
 #define poll ___xxx_poll
 
-static __inline__ void  adb_sleep_ms( int  mseconds )
-{
-    usleep( mseconds*1000 );
-}
-
 static __inline__ int  adb_mkdir(const std::string& path, int mode)
 {
     return mkdir(path.c_str(), mode);
@@ -820,10 +764,6 @@ static __inline__ int  adb_mkdir(const std::string& path, int mode)
 
 #undef   mkdir
 #define  mkdir  ___xxx_mkdir
-
-static __inline__ void  adb_sysdeps_init(void)
-{
-}
 
 static __inline__ int adb_is_absolute_host_path(const char* path) {
     return path[0] == '/';
@@ -845,5 +785,10 @@ static inline void disable_tcp_nagle(int fd) {
 // |interval_sec| to 0 to disable keepalives. If keepalives are enabled, the connection will be
 // configured to drop after 10 missed keepalives. Returns true on success.
 bool set_tcp_keepalive(int fd, int interval_sec);
+
+#if defined(_WIN32)
+// Win32 defines ERROR, which we don't need, but which conflicts with google3 logging.
+#undef ERROR
+#endif
 
 #endif /* _ADB_SYSDEPS_H */

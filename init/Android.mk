@@ -47,6 +47,8 @@ include $(CLEAR_VARS)
 LOCAL_CPPFLAGS := $(init_cflags)
 LOCAL_SRC_FILES:= \
     action.cpp \
+    capabilities.cpp \
+    descriptors.cpp \
     import_parser.cpp \
     init_parser.cpp \
     log.cpp \
@@ -54,7 +56,8 @@ LOCAL_SRC_FILES:= \
     service.cpp \
     util.cpp \
 
-LOCAL_STATIC_LIBRARIES := libbase libselinux
+LOCAL_STATIC_LIBRARIES := libbase libselinux liblog libprocessgroup libnl
+LOCAL_WHOLE_STATIC_LIBRARIES := libcap
 LOCAL_MODULE := libinit
 LOCAL_SANITIZE := integer
 LOCAL_CLANG := true
@@ -76,7 +79,6 @@ LOCAL_SRC_FILES:= \
 
 LOCAL_MODULE:= init
 LOCAL_C_INCLUDES += \
-    system/extras/ext4_utils \
     system/core/mkbootimg
 
 LOCAL_FORCE_STATIC_EXECUTABLE := true
@@ -85,27 +87,47 @@ LOCAL_UNSTRIPPED_PATH := $(TARGET_ROOT_OUT_UNSTRIPPED)
 
 LOCAL_STATIC_LIBRARIES := \
     libinit \
-    libbootloader_message_writer \
+    libbootloader_message \
     libfs_mgr \
     libfec \
     libfec_rs \
     libsquashfs_utils \
     liblogwrap \
     libcutils \
-    libext4_utils_static \
+    libext4_utils \
     libbase \
-    libutils \
     libc \
     libselinux \
     liblog \
-    libmincrypt \
-    libcrypto_static \
+    libcrypto_utils \
+    libcrypto \
     libc++_static \
     libdl \
-    libsparse_static \
-    libz
+    libsparse \
+    libz \
+    libprocessgroup \
+    libnl \
+    libavb
 
-# Create symlinks
+# Include SELinux policy. We do this here because different modules
+# need to be included based on the value of PRODUCT_FULL_TREBLE. This
+# type of conditional inclusion cannot be done in top-level files such
+# as build/target/product/embedded.mk.
+# This conditional inclusion closely mimics the conditional logic
+# inside init/init.cpp for loading SELinux policy from files.
+ifeq ($(PRODUCT_FULL_TREBLE),true)
+# Use split SELinux policy
+LOCAL_REQUIRED_MODULES += \
+    mapping_sepolicy.cil \
+    nonplat_sepolicy.cil \
+    plat_sepolicy.cil \
+    secilc
+else
+# Use monolithic SELinux policy
+LOCAL_REQUIRED_MODULES += sepolicy
+endif
+
+# Create symlinks.
 LOCAL_POST_INSTALL_CMD := $(hide) mkdir -p $(TARGET_ROOT_OUT)/sbin; \
     ln -sf ../init $(TARGET_ROOT_OUT)/sbin/ueventd; \
     ln -sf ../init $(TARGET_ROOT_OUT)/sbin/watchdogd
@@ -115,12 +137,13 @@ LOCAL_CLANG := true
 include $(BUILD_EXECUTABLE)
 
 
-
-
+# Unit tests.
+# =========================================================
 include $(CLEAR_VARS)
 LOCAL_MODULE := init_tests
 LOCAL_SRC_FILES := \
     init_parser_test.cpp \
+    property_service_test.cpp \
     util_test.cpp \
 
 LOCAL_SHARED_LIBRARIES += \
@@ -130,4 +153,10 @@ LOCAL_SHARED_LIBRARIES += \
 LOCAL_STATIC_LIBRARIES := libinit
 LOCAL_SANITIZE := integer
 LOCAL_CLANG := true
+LOCAL_CPPFLAGS := -Wall -Wextra -Werror
 include $(BUILD_NATIVE_TEST)
+
+
+# Include targets in subdirs.
+# =========================================================
+include $(call all-makefiles-under,$(LOCAL_PATH))

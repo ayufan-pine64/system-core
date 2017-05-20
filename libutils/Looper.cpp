@@ -13,18 +13,17 @@
 // Debugs callback registration and invocation.
 #define DEBUG_CALLBACKS 0
 
-#include <cutils/log.h>
-#include <utils/Looper.h>
-#include <utils/Timers.h>
-
 #include <errno.h>
 #include <fcntl.h>
-#include <limits.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
 
+#include <log/log.h>
+#include <utils/Looper.h>
+#include <utils/Timers.h>
 
 namespace android {
 
@@ -676,5 +675,9 @@ void Looper::Request::initEventItem(struct epoll_event* eventItem) const {
     eventItem->events = epollEvents;
     eventItem->data.fd = fd;
 }
+
+MessageHandler::~MessageHandler() { }
+
+LooperCallback::~LooperCallback() { }
 
 } // namespace android

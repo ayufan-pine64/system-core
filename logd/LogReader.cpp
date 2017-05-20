@@ -21,6 +21,7 @@
 #include <sys/types.h>
 
 #include <cutils/sockets.h>
+#include <private/android_logger.h>
 
 #include "FlushCommand.h"
 #include "LogBuffer.h"
@@ -107,7 +108,7 @@ bool LogReader::onDataAvailable(SocketClient *cli) {
     }
 
     bool nonBlock = false;
-    if (!fast<strncmp>(buffer, "dumpAndClose", 12)) {
+    if (!fastcmp<strncmp>(buffer, "dumpAndClose", 12)) {
         // Allow writer to get some cycles, and wait for pending notifications
         sched_yield();
         LogTimeEntry::lock();

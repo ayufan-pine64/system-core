@@ -19,11 +19,16 @@
 
 #include <sys/types.h>
 
+#include <deque>
+#include <functional>
 #include <list>
+#include <memory>
 #include <string>
 #include <unordered_set>
 
 #include "adb.h"
+
+#include <openssl/rsa.h>
 
 typedef std::unordered_set<std::string> FeatureSet;
 
@@ -41,6 +46,9 @@ bool CanUseFeature(const FeatureSet& feature_set, const std::string& feature);
 extern const char* const kFeatureShell2;
 // The 'cmd' command is available
 extern const char* const kFeatureCmd;
+extern const char* const kFeatureStat2;
+// The server is running with libusb enabled.
+extern const char* const kFeatureLibusb;
 
 class atransport {
 public:
@@ -87,10 +95,28 @@ public:
     char* model = nullptr;
     char* device = nullptr;
     char* devpath = nullptr;
-    int adb_port = -1;  // Use for emulators (local transport)
+    void SetLocalPortForEmulator(int port) {
+        CHECK_EQ(local_port_for_emulator_, -1);
+        local_port_for_emulator_ = port;
+    }
 
-    void* key = nullptr;
-    unsigned char token[TOKEN_SIZE] = {};
+    bool GetLocalPortForEmulator(int* port) const {
+        if (type == kTransportLocal && local_port_for_emulator_ != -1) {
+            *port = local_port_for_emulator_;
+            return true;
+        }
+        return false;
+    }
+
+    bool IsTcpDevice() const {
+        return type == kTransportLocal && local_port_for_emulator_ == -1;
+    }
+
+#if ADB_HOST
+    std::shared_ptr<RSA> NextKey();
+#endif
+
+    char token[TOKEN_SIZE] = {};
     size_t failed_auth_attempts = 0;
 
     const std::string connection_state_name() const;
@@ -128,6 +154,7 @@ public:
     bool MatchesTarget(const std::string& target) const;
 
 private:
+    int local_port_for_emulator_ = -1;
     bool kicked_ = false;
     void (*kick_func_)(atransport*) = nullptr;
 
@@ -139,6 +166,10 @@ private:
 
     // A list of adisconnect callbacks called when the transport is kicked.
     std::list<adisconnect*> disconnects_;
+
+#if ADB_HOST
+    std::deque<std::shared_ptr<RSA>> keys_;
+#endif
 
     DISALLOW_COPY_AND_ASSIGN(atransport);
 };
@@ -172,8 +203,8 @@ void unregister_usb_transport(usb_handle* usb);
 int check_header(apacket* p, atransport* t);
 int check_data(apacket* p);
 
-/* for MacOS X cleanup */
 void close_usb_devices();
+void close_usb_devices(std::function<bool(const atransport*)> predicate);
 
 void send_packet(apacket* p, atransport* t);
 

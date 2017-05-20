@@ -18,7 +18,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <fstream>
+#include <inttypes.h>
 #include <libgen.h>
 #include <paths.h>
 #include <signal.h>
@@ -30,12 +30,11 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-#include <mtd/mtd-user.h>
 
 #include <selinux/selinux.h>
 #include <selinux/label.h>
@@ -44,18 +43,23 @@
 #include <android-base/file.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <cutils/android_reboot.h>
+#include <android-base/unique_fd.h>
 #include <cutils/fs.h>
 #include <cutils/iosched_policy.h>
 #include <cutils/list.h>
 #include <cutils/sockets.h>
+#include <libavb/libavb.h>
 #include <private/android_filesystem_config.h>
 
+#include <fstream>
 #include <memory>
+#include <set>
+#include <vector>
 
 #include "action.h"
 #include "bootchart.h"
 #include "devices.h"
+#include "fs_mgr.h"
 #include "import_parser.h"
 #include "init.h"
 #include "init_parser.h"
@@ -68,6 +72,8 @@
 #include "util.h"
 #include "watchdogd.h"
 
+using android::base::StringPrintf;
+
 struct selabel_handle *sehandle;
 struct selabel_handle *sehandle_prop;
 
@@ -75,22 +81,25 @@ static int property_triggers_enabled = 0;
 
 static char qemu[32];
 
-int have_console;
-std::string console_name = "/dev/console";
-static time_t process_needs_restart;
+std::string default_console = "/dev/console";
+static time_t process_needs_restart_at;
 
 const char *ENV[32];
 
-bool waiting_for_exec = false;
+static std::unique_ptr<Timer> waiting_for_exec(nullptr);
 
 static int epoll_fd = -1;
+
+static std::unique_ptr<Timer> waiting_for_prop(nullptr);
+static std::string wait_prop_name;
+static std::string wait_prop_value;
 
 void register_epoll_handler(int fd, void (*fn)()) {
     epoll_event ev;
     ev.events = EPOLLIN;
     ev.data.ptr = reinterpret_cast<void*>(fn);
     if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
-        ERROR("epoll_ctl failed: %s\n", strerror(errno));
+        PLOG(ERROR) << "epoll_ctl failed";
     }
 }
 
@@ -101,7 +110,7 @@ int add_environment(const char *key, const char *val)
     size_t key_len = strlen(key);
 
     /* The last environment entry is reserved to terminate the list */
-    for (n = 0; n < (ARRAY_SIZE(ENV) - 1); n++) {
+    for (n = 0; n < (arraysize(ENV) - 1); n++) {
 
         /* Delete any existing entry for this key */
         if (ENV[n] != NULL) {
@@ -121,30 +130,71 @@ int add_environment(const char *key, const char *val)
         }
     }
 
-    ERROR("No env. room to store: '%s':'%s'\n", key, val);
+    LOG(ERROR) << "No env. room to store: '" << key << "':'" << val << "'";
 
     return -1;
+}
+
+bool start_waiting_for_exec()
+{
+    if (waiting_for_exec) {
+        return false;
+    }
+    waiting_for_exec.reset(new Timer());
+    return true;
+}
+
+void stop_waiting_for_exec()
+{
+    if (waiting_for_exec) {
+        LOG(INFO) << "Wait for exec took " << *waiting_for_exec;
+        waiting_for_exec.reset();
+    }
+}
+
+bool start_waiting_for_property(const char *name, const char *value)
+{
+    if (waiting_for_prop) {
+        return false;
+    }
+    if (property_get(name) != value) {
+        // Current property value is not equal to expected value
+        wait_prop_name = name;
+        wait_prop_value = value;
+        waiting_for_prop.reset(new Timer());
+    } else {
+        LOG(INFO) << "start_waiting_for_property(\""
+                  << name << "\", \"" << value << "\"): already set";
+    }
+    return true;
 }
 
 void property_changed(const char *name, const char *value)
 {
     if (property_triggers_enabled)
         ActionManager::GetInstance().QueuePropertyTrigger(name, value);
+    if (waiting_for_prop) {
+        if (wait_prop_name == name && wait_prop_value == value) {
+            wait_prop_name.clear();
+            wait_prop_value.clear();
+            LOG(INFO) << "Wait for property took " << *waiting_for_prop;
+            waiting_for_prop.reset();
+        }
+    }
 }
 
 static void restart_processes()
 {
-    process_needs_restart = 0;
-    ServiceManager::GetInstance().
-        ForEachServiceWithFlags(SVC_RESTARTING, [] (Service* s) {
-                s->RestartIfNeeded(process_needs_restart);
-            });
+    process_needs_restart_at = 0;
+    ServiceManager::GetInstance().ForEachServiceWithFlags(SVC_RESTARTING, [](Service* s) {
+        s->RestartIfNeeded(&process_needs_restart_at);
+    });
 }
 
 void handle_control_message(const std::string& msg, const std::string& name) {
     Service* svc = ServiceManager::GetInstance().FindServiceByName(name);
     if (svc == nullptr) {
-        ERROR("no such service '%s'\n", name.c_str());
+        LOG(ERROR) << "no such service '" << name << "'";
         return;
     }
 
@@ -155,22 +205,29 @@ void handle_control_message(const std::string& msg, const std::string& name) {
     } else if (msg == "restart") {
         svc->Restart();
     } else {
-        ERROR("unknown control msg '%s'\n", msg.c_str());
+        LOG(ERROR) << "unknown control msg '" << msg << "'";
     }
 }
 
 static int wait_for_coldboot_done_action(const std::vector<std::string>& args) {
     Timer t;
 
-    NOTICE("Waiting for %s...\n", COLDBOOT_DONE);
-    // Any longer than 1s is an unreasonable length of time to delay booting.
-    // If you're hitting this timeout, check that you didn't make your
-    // sepolicy regular expressions too expensive (http://b/19899875).
-    if (wait_for_file(COLDBOOT_DONE, 1)) {
-        ERROR("Timed out waiting for %s\n", COLDBOOT_DONE);
+    LOG(VERBOSE) << "Waiting for " COLDBOOT_DONE "...";
+
+    // Historically we had a 1s timeout here because we weren't otherwise
+    // tracking boot time, and many OEMs made their sepolicy regular
+    // expressions too expensive (http://b/19899875).
+
+    // Now we're tracking boot time, just log the time taken to a system
+    // property. We still panic if it takes more than a minute though,
+    // because any build that slow isn't likely to boot at all, and we'd
+    // rather any test lab devices fail back to the bootloader.
+    if (wait_for_file(COLDBOOT_DONE, 60s) < 0) {
+        LOG(ERROR) << "Timed out waiting for " COLDBOOT_DONE;
+        panic();
     }
 
-    NOTICE("Waiting for %s took %.2fs.\n", COLDBOOT_DONE, t.duration());
+    property_set("ro.boottime.init.cold_boot_wait", std::to_string(t.duration_ms()).c_str());
     return 0;
 }
 
@@ -202,11 +259,11 @@ static int mix_hwrng_into_linux_rng_action(const std::vector<std::string>& args)
             open("/dev/hw_random", O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
     if (hwrandom_fd == -1) {
         if (errno == ENOENT) {
-          ERROR("/dev/hw_random not found\n");
-          /* It's not an error to not have a Hardware RNG. */
-          result = 0;
+            LOG(ERROR) << "/dev/hw_random not found";
+            // It's not an error to not have a Hardware RNG.
+            result = 0;
         } else {
-          ERROR("Failed to open /dev/hw_random: %s\n", strerror(errno));
+            PLOG(ERROR) << "Failed to open /dev/hw_random";
         }
         goto ret;
     }
@@ -214,7 +271,7 @@ static int mix_hwrng_into_linux_rng_action(const std::vector<std::string>& args)
     urandom_fd = TEMP_FAILURE_RETRY(
             open("/dev/urandom", O_WRONLY | O_NOFOLLOW | O_CLOEXEC));
     if (urandom_fd == -1) {
-        ERROR("Failed to open /dev/urandom: %s\n", strerror(errno));
+        PLOG(ERROR) << "Failed to open /dev/urandom";
         goto ret;
     }
 
@@ -222,23 +279,22 @@ static int mix_hwrng_into_linux_rng_action(const std::vector<std::string>& args)
         chunk_size = TEMP_FAILURE_RETRY(
                 read(hwrandom_fd, buf, sizeof(buf) - total_bytes_written));
         if (chunk_size == -1) {
-            ERROR("Failed to read from /dev/hw_random: %s\n", strerror(errno));
+            PLOG(ERROR) << "Failed to read from /dev/hw_random";
             goto ret;
         } else if (chunk_size == 0) {
-            ERROR("Failed to read from /dev/hw_random: EOF\n");
+            LOG(ERROR) << "Failed to read from /dev/hw_random: EOF";
             goto ret;
         }
 
         chunk_size = TEMP_FAILURE_RETRY(write(urandom_fd, buf, chunk_size));
         if (chunk_size == -1) {
-            ERROR("Failed to write to /dev/urandom: %s\n", strerror(errno));
+            PLOG(ERROR) << "Failed to write to /dev/urandom";
             goto ret;
         }
         total_bytes_written += chunk_size;
     }
 
-    INFO("Mixed %zu bytes from /dev/hw_random into /dev/urandom",
-                total_bytes_written);
+    LOG(INFO) << "Mixed " << total_bytes_written << " bytes from /dev/hw_random into /dev/urandom";
     result = 0;
 
 ret:
@@ -252,9 +308,46 @@ ret:
 }
 
 static void security_failure() {
-    ERROR("Security failure; rebooting into recovery mode...\n");
-    android_reboot(ANDROID_RB_RESTART2, 0, "recovery");
-    while (true) { pause(); }  // never reached
+    LOG(ERROR) << "Security failure...";
+    panic();
+}
+
+static bool set_highest_available_option_value(std::string path, int min, int max)
+{
+    std::ifstream inf(path, std::fstream::in);
+    if (!inf) {
+        LOG(ERROR) << "Cannot open for reading: " << path;
+        return false;
+    }
+
+    int current = max;
+    while (current >= min) {
+        // try to write out new value
+        std::string str_val = std::to_string(current);
+        std::ofstream of(path, std::fstream::out);
+        if (!of) {
+            LOG(ERROR) << "Cannot open for writing: " << path;
+            return false;
+        }
+        of << str_val << std::endl;
+        of.close();
+
+        // check to make sure it was recorded
+        inf.seekg(0);
+        std::string str_rec;
+        inf >> str_rec;
+        if (str_val.compare(str_rec) == 0) {
+            break;
+        }
+        current--;
+    }
+    inf.close();
+
+    if (current < min) {
+        LOG(ERROR) << "Unable to set minimum option value " << min << " in " << path;
+        return false;
+    }
+    return true;
 }
 
 #define MMAP_RND_PATH "/proc/sys/vm/mmap_rnd_bits"
@@ -269,39 +362,23 @@ static bool __attribute__((unused)) set_mmap_rnd_bits_min(int start, int min, bo
     } else {
         path = MMAP_RND_PATH;
     }
-    std::ifstream inf(path, std::fstream::in);
-    if (!inf) {
-        return false;
-    }
-    while (start >= min) {
-        // try to write out new value
-        std::string str_val = std::to_string(start);
-        std::ofstream of(path, std::fstream::out);
-        if (!of) {
-            return false;
-        }
-        of << str_val << std::endl;
-        of.close();
 
-        // check to make sure it was recorded
-        inf.seekg(0);
-        std::string str_rec;
-        inf >> str_rec;
-        if (str_val.compare(str_rec) == 0) {
-            break;
-        }
-        start--;
-    }
-    inf.close();
-    return (start >= min);
+    return set_highest_available_option_value(path, min, start);
 }
 
 /*
  * Set /proc/sys/vm/mmap_rnd_bits and potentially
  * /proc/sys/vm/mmap_rnd_compat_bits to the maximum supported values.
- * Returns -1 if unable to set these to an acceptable value.  Apply
- * upstream patch-sets https://lkml.org/lkml/2015/12/21/337 and
- * https://lkml.org/lkml/2016/2/4/831 to enable this.
+ * Returns -1 if unable to set these to an acceptable value.
+ *
+ * To support this sysctl, the following upstream commits are needed:
+ *
+ * d07e22597d1d mm: mmap: add new /proc tunable for mmap_base ASLR
+ * e0c25d958f78 arm: mm: support ARCH_MMAP_RND_BITS
+ * 8f0d3aa9de57 arm64: mm: support ARCH_MMAP_RND_BITS
+ * 9e08f57d684a x86: mm: support ARCH_MMAP_RND_BITS
+ * ec9ee4acd97c drivers: char: random: add get_random_long()
+ * 5ef11c35ce86 mm: ASLR: use get_random_long()
  */
 static int set_mmap_rnd_bits_action(const std::vector<std::string>& args)
 {
@@ -331,18 +408,33 @@ static int set_mmap_rnd_bits_action(const std::vector<std::string>& args)
     // TODO: add mips support b/27788820
     ret = 0;
 #else
-    ERROR("Unknown architecture\n");
+    LOG(ERROR) << "Unknown architecture";
 #endif
 
-#ifdef __BRILLO__
-    // TODO: b/27794137
-    ret = 0;
-#endif
     if (ret == -1) {
         ERROR("Unable to set adequate mmap entropy value!\n");
         // security_failure();
     }
     return ret;
+}
+
+#define KPTR_RESTRICT_PATH "/proc/sys/kernel/kptr_restrict"
+#define KPTR_RESTRICT_MINVALUE 2
+#define KPTR_RESTRICT_MAXVALUE 4
+
+/* Set kptr_restrict to the highest available level.
+ *
+ * Aborts if unable to set this to an acceptable value.
+ */
+static int set_kptr_restrict_action(const std::vector<std::string>& args)
+{
+    std::string path = KPTR_RESTRICT_PATH;
+
+    if (!set_highest_available_option_value(path, KPTR_RESTRICT_MINVALUE, KPTR_RESTRICT_MAXVALUE)) {
+        LOG(ERROR) << "Unable to set adequate kptr_restrict value!";
+        security_failure();
+    }
+    return 0;
 }
 
 static int keychord_init_action(const std::vector<std::string>& args)
@@ -355,36 +447,8 @@ static int console_init_action(const std::vector<std::string>& args)
 {
     std::string console = property_get("ro.boot.console");
     if (!console.empty()) {
-        console_name = "/dev/" + console;
+        default_console = "/dev/" + console;
     }
-
-    int fd = open(console_name.c_str(), O_RDWR | O_CLOEXEC);
-    if (fd >= 0)
-        have_console = 1;
-    close(fd);
-
-    fd = open("/dev/tty0", O_WRONLY | O_CLOEXEC);
-    if (fd >= 0) {
-        const char *msg;
-            msg = "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"  // console is 40 cols x 30 lines
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "\n"
-        "             A N D R O I D ";
-        write(fd, msg, strlen(msg));
-        close(fd);
-    }
-
     return 0;
 }
 
@@ -393,15 +457,14 @@ static void import_kernel_nv(const std::string& key, const std::string& value, b
 
     if (for_emulator) {
         // In the emulator, export any kernel option with the "ro.kernel." prefix.
-        property_set(android::base::StringPrintf("ro.kernel.%s", key.c_str()).c_str(), value.c_str());
+        property_set(StringPrintf("ro.kernel.%s", key.c_str()).c_str(), value.c_str());
         return;
     }
 
     if (key == "qemu") {
         strlcpy(qemu, value.c_str(), sizeof(qemu));
     } else if (android::base::StartsWith(key, "androidboot.")) {
-        property_set(android::base::StringPrintf("ro.boot.%s", key.c_str() + 12).c_str(),
-                     value.c_str());
+        property_set(StringPrintf("ro.boot.%s", key.c_str() + 12).c_str(), value.c_str());
     }
 }
 
@@ -430,47 +493,68 @@ static void export_kernel_boot_props() {
         { "ro.boot.hardware",   "ro.hardware",   "unknown", },
         { "ro.boot.revision",   "ro.revision",   "0", },
     };
-    for (size_t i = 0; i < ARRAY_SIZE(prop_map); i++) {
+    for (size_t i = 0; i < arraysize(prop_map); i++) {
         std::string value = property_get(prop_map[i].src_prop);
         property_set(prop_map[i].dst_prop, (!value.empty()) ? value.c_str() : prop_map[i].default_value);
     }
 }
 
-static void process_kernel_dt() {
-    static const char android_dir[] = "/proc/device-tree/firmware/android";
+static constexpr char android_dt_dir[] = "/proc/device-tree/firmware/android";
 
-    std::string file_name = android::base::StringPrintf("%s/compatible", android_dir);
+static bool is_dt_compatible() {
+    std::string dt_value;
+    std::string file_name = StringPrintf("%s/compatible", android_dt_dir);
 
-    std::string dt_file;
-    android::base::ReadFileToString(file_name, &dt_file);
-    if (!dt_file.compare("android,firmware")) {
-        ERROR("firmware/android is not compatible with 'android,firmware'\n");
-        return;
+    if (android::base::ReadFileToString(file_name, &dt_value)) {
+        // trim the trailing '\0' out, otherwise the comparison
+        // will produce false-negatives.
+        dt_value.resize(dt_value.size() - 1);
+        if (dt_value == "android,firmware") {
+            return true;
+        }
     }
 
-    std::unique_ptr<DIR, int(*)(DIR*)>dir(opendir(android_dir), closedir);
+    return false;
+}
+
+static bool is_dt_fstab_compatible() {
+    std::string dt_value;
+    std::string file_name = StringPrintf("%s/%s/compatible", android_dt_dir, "fstab");
+
+    if (android::base::ReadFileToString(file_name, &dt_value)) {
+        dt_value.resize(dt_value.size() - 1);
+        if (dt_value == "android,fstab") {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void process_kernel_dt() {
+    if (!is_dt_compatible()) return;
+
+    std::unique_ptr<DIR, int(*)(DIR*)>dir(opendir(android_dt_dir), closedir);
     if (!dir) return;
 
+    std::string dt_file;
     struct dirent *dp;
     while ((dp = readdir(dir.get())) != NULL) {
         if (dp->d_type != DT_REG || !strcmp(dp->d_name, "compatible") || !strcmp(dp->d_name, "name")) {
             continue;
         }
 
-        file_name = android::base::StringPrintf("%s/%s", android_dir, dp->d_name);
+        std::string file_name = StringPrintf("%s/%s", android_dt_dir, dp->d_name);
 
         android::base::ReadFileToString(file_name, &dt_file);
         std::replace(dt_file.begin(), dt_file.end(), ',', '.');
 
-        std::string property_name = android::base::StringPrintf("ro.boot.%s", dp->d_name);
+        std::string property_name = StringPrintf("ro.boot.%s", dp->d_name);
         property_set(property_name.c_str(), dt_file.c_str());
     }
 }
 
 static void process_kernel_cmdline() {
-    // Don't expose the raw commandline to unprivileged processes.
-    chmod("/proc/cmdline", 0440);
-
     // The first pass does the common stuff, and finds if we are in qemu.
     // The second pass is only necessary for qemu to export all kernel params
     // as properties.
@@ -478,11 +562,17 @@ static void process_kernel_cmdline() {
     if (qemu[0]) import_kernel_cmdline(true, import_kernel_nv);
 }
 
+static int property_enable_triggers_action(const std::vector<std::string>& args)
+{
+    /* Enable property triggers. */
+    property_triggers_enabled = 1;
+    return 0;
+}
+
 static int queue_property_triggers_action(const std::vector<std::string>& args)
 {
+    ActionManager::GetInstance().QueueBuiltinAction(property_enable_triggers_action, "enable_property_trigger");
     ActionManager::GetInstance().QueueAllPropertyTriggers();
-    /* enable property triggers */
-    property_triggers_enabled = 1;
     return 0;
 }
 
@@ -515,36 +605,192 @@ static bool selinux_is_enforcing(void)
     return true;
 }
 
-int selinux_reload_policy(void)
-{
-    INFO("SELinux: Attempting to reload policy files\n");
-
-    if (selinux_android_reload_policy() == -1) {
-        return -1;
-    }
-
-    if (sehandle)
-        selabel_close(sehandle);
-
-    if (sehandle_prop)
-        selabel_close(sehandle_prop);
-
-    selinux_init_all_handles();
-    return 0;
-}
-
 static int audit_callback(void *data, security_class_t /*cls*/, char *buf, size_t len) {
 
     property_audit_data *d = reinterpret_cast<property_audit_data*>(data);
 
     if (!d || !d->name || !d->cr) {
-        ERROR("audit_callback invoked with null data arguments!");
+        LOG(ERROR) << "audit_callback invoked with null data arguments!";
         return 0;
     }
 
     snprintf(buf, len, "property=%s pid=%d uid=%d gid=%d", d->name,
             d->cr->pid, d->cr->uid, d->cr->gid);
     return 0;
+}
+
+/*
+ * Forks, executes the provided program in the child, and waits for the completion in the parent.
+ * Child's stderr is captured and logged using LOG(ERROR).
+ *
+ * Returns true if the child exited with status code 0, returns false otherwise.
+ */
+static bool fork_execve_and_wait_for_completion(const char* filename, char* const argv[],
+                                                char* const envp[]) {
+    // Create a pipe used for redirecting child process's output.
+    // * pipe_fds[0] is the FD the parent will use for reading.
+    // * pipe_fds[1] is the FD the child will use for writing.
+    int pipe_fds[2];
+    if (pipe(pipe_fds) == -1) {
+        PLOG(ERROR) << "Failed to create pipe";
+        return false;
+    }
+
+    pid_t child_pid = fork();
+    if (child_pid == -1) {
+        PLOG(ERROR) << "Failed to fork for " << filename;
+        return false;
+    }
+
+    if (child_pid == 0) {
+        // fork succeeded -- this is executing in the child process
+
+        // Close the pipe FD not used by this process
+        TEMP_FAILURE_RETRY(close(pipe_fds[0]));
+
+        // Redirect stderr to the pipe FD provided by the parent
+        if (TEMP_FAILURE_RETRY(dup2(pipe_fds[1], STDERR_FILENO)) == -1) {
+            PLOG(ERROR) << "Failed to redirect stderr of " << filename;
+            _exit(127);
+            return false;
+        }
+        TEMP_FAILURE_RETRY(close(pipe_fds[1]));
+
+        if (execve(filename, argv, envp) == -1) {
+            PLOG(ERROR) << "Failed to execve " << filename;
+            return false;
+        }
+        // Unreachable because execve will have succeeded and replaced this code
+        // with child process's code.
+        _exit(127);
+        return false;
+    } else {
+        // fork succeeded -- this is executing in the original/parent process
+
+        // Close the pipe FD not used by this process
+        TEMP_FAILURE_RETRY(close(pipe_fds[1]));
+
+        // Log the redirected output of the child process.
+        // It's unfortunate that there's no standard way to obtain an istream for a file descriptor.
+        // As a result, we're buffering all output and logging it in one go at the end of the
+        // invocation, instead of logging it as it comes in.
+        const int child_out_fd = pipe_fds[0];
+        std::string child_output;
+        if (!android::base::ReadFdToString(child_out_fd, &child_output)) {
+            PLOG(ERROR) << "Failed to capture full output of " << filename;
+        }
+        TEMP_FAILURE_RETRY(close(child_out_fd));
+        if (!child_output.empty()) {
+            // Log captured output, line by line, because LOG expects to be invoked for each line
+            std::istringstream in(child_output);
+            std::string line;
+            while (std::getline(in, line)) {
+                LOG(ERROR) << filename << ": " << line;
+            }
+        }
+
+        // Wait for child to terminate
+        int status;
+        if (TEMP_FAILURE_RETRY(waitpid(child_pid, &status, 0)) != child_pid) {
+            PLOG(ERROR) << "Failed to wait for " << filename;
+            return false;
+        }
+
+        if (WIFEXITED(status)) {
+            int status_code = WEXITSTATUS(status);
+            if (status_code == 0) {
+                return true;
+            } else {
+                LOG(ERROR) << filename << " exited with status " << status_code;
+            }
+        } else if (WIFSIGNALED(status)) {
+            LOG(ERROR) << filename << " killed by signal " << WTERMSIG(status);
+        } else if (WIFSTOPPED(status)) {
+            LOG(ERROR) << filename << " stopped by signal " << WSTOPSIG(status);
+        } else {
+            LOG(ERROR) << "waitpid for " << filename << " returned unexpected status: " << status;
+        }
+
+        return false;
+    }
+}
+
+static constexpr const char plat_policy_cil_file[] = "/system/etc/selinux/plat_sepolicy.cil";
+
+static bool selinux_is_split_policy_device() { return access(plat_policy_cil_file, R_OK) != -1; }
+
+/*
+ * Loads SELinux policy split across platform/system and non-platform/vendor files.
+ *
+ * Returns true upon success, false otherwise (failure cause is logged).
+ */
+static bool selinux_load_split_policy() {
+    // IMPLEMENTATION NOTE: Split policy consists of three CIL files:
+    // * platform -- policy needed due to logic contained in the system image,
+    // * non-platform -- policy needed due to logic contained in the vendor image,
+    // * mapping -- mapping policy which helps preserve forward-compatibility of non-platform policy
+    //   with newer versions of platform policy.
+    //
+    // secilc is invoked to compile the above three policy files into a single monolithic policy
+    // file. This file is then loaded into the kernel.
+
+    LOG(INFO) << "Compiling SELinux policy";
+
+    // We store the output of the compilation on /dev because this is the most convenient tmpfs
+    // storage mount available this early in the boot sequence.
+    char compiled_sepolicy[] = "/dev/sepolicy.XXXXXX";
+    android::base::unique_fd compiled_sepolicy_fd(mkostemp(compiled_sepolicy, O_CLOEXEC));
+    if (compiled_sepolicy_fd < 0) {
+        PLOG(ERROR) << "Failed to create temporary file " << compiled_sepolicy;
+        return false;
+    }
+
+    const char* compile_args[] = {"/system/bin/secilc", plat_policy_cil_file, "-M", "true", "-c",
+                                  "30",  // TODO: pass in SELinux policy version from build system
+                                  "/vendor/etc/selinux/mapping_sepolicy.cil",
+                                  "/vendor/etc/selinux/nonplat_sepolicy.cil", "-o",
+                                  compiled_sepolicy,
+                                  // We don't care about file_contexts output by the compiler
+                                  "-f", "/sys/fs/selinux/null",  // /dev/null is not yet available
+                                  nullptr};
+
+    if (!fork_execve_and_wait_for_completion(compile_args[0], (char**)compile_args, (char**)ENV)) {
+        unlink(compiled_sepolicy);
+        return false;
+    }
+    unlink(compiled_sepolicy);
+
+    LOG(INFO) << "Loading compiled SELinux policy";
+    if (selinux_android_load_policy_from_fd(compiled_sepolicy_fd, compiled_sepolicy) < 0) {
+        LOG(ERROR) << "Failed to load SELinux policy from " << compiled_sepolicy;
+        return false;
+    }
+
+    return true;
+}
+
+/*
+ * Loads SELinux policy from a monolithic file.
+ *
+ * Returns true upon success, false otherwise (failure cause is logged).
+ */
+static bool selinux_load_monolithic_policy() {
+    LOG(VERBOSE) << "Loading SELinux policy from monolithic file";
+    if (selinux_android_load_policy() < 0) {
+        PLOG(ERROR) << "Failed to load monolithic SELinux policy";
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Loads SELinux policy into the kernel.
+ *
+ * Returns true upon success, false otherwise (failure cause is logged).
+ */
+static bool selinux_load_policy() {
+    return selinux_is_split_policy_device() ? selinux_load_split_policy()
+                                            : selinux_load_monolithic_policy();
 }
 
 static void selinux_initialize(bool in_kernel_domain) {
@@ -557,31 +803,238 @@ static void selinux_initialize(bool in_kernel_domain) {
     selinux_set_callback(SELINUX_CB_AUDIT, cb);
 
     if (in_kernel_domain) {
-        INFO("Loading SELinux policy...\n");
-        if (selinux_android_load_policy() < 0) {
-            ERROR("failed to load policy: %s\n", strerror(errno));
-            security_failure();
+        LOG(INFO) << "Loading SELinux policy";
+        if (!selinux_load_policy()) {
+            panic();
         }
 
         bool kernel_enforcing = (security_getenforce() == 1);
         bool is_enforcing = selinux_is_enforcing();
         if (kernel_enforcing != is_enforcing) {
             if (security_setenforce(is_enforcing)) {
+<<<<<<< HEAD
                 ERROR("security_setenforce(%s) failed: %s\n",
                       is_enforcing ? "true" : "false", strerror(errno));
                 // security_failure();
+=======
+                PLOG(ERROR) << "security_setenforce(%s) failed" << (is_enforcing ? "true" : "false");
+                security_failure();
+>>>>>>> aosp/o-preview
             }
         }
 
-        if (write_file("/sys/fs/selinux/checkreqprot", "0") == -1) {
+        if (!write_file("/sys/fs/selinux/checkreqprot", "0")) {
             security_failure();
         }
 
-        NOTICE("(Initializing SELinux %s took %.2fs.)\n",
-               is_enforcing ? "enforcing" : "non-enforcing", t.duration());
+        // init's first stage can't set properties, so pass the time to the second stage.
+        setenv("INIT_SELINUX_TOOK", std::to_string(t.duration_ms()).c_str(), 1);
     } else {
         selinux_init_all_handles();
     }
+}
+
+// Set the UDC controller for the ConfigFS USB Gadgets.
+// Read the UDC controller in use from "/sys/class/udc".
+// In case of multiple UDC controllers select the first one.
+static void set_usb_controller() {
+    std::unique_ptr<DIR, decltype(&closedir)>dir(opendir("/sys/class/udc"), closedir);
+    if (!dir) return;
+
+    dirent* dp;
+    while ((dp = readdir(dir.get())) != nullptr) {
+        if (dp->d_name[0] == '.') continue;
+
+        property_set("sys.usb.controller", dp->d_name);
+        break;
+    }
+}
+
+static bool early_mount_one(struct fstab_rec* rec) {
+    if (rec && fs_mgr_is_verified(rec)) {
+        // setup verity and create the dm-XX block device
+        // needed to mount this partition
+        int ret = fs_mgr_setup_verity(rec, false);
+        if (ret == FS_MGR_SETUP_VERITY_FAIL) {
+            PLOG(ERROR) << "early_mount: Failed to setup verity for '" << rec->mount_point << "'";
+            return false;
+        }
+
+        // The exact block device name is added as a mount source by
+        // fs_mgr_setup_verity() in ->blk_device as "/dev/block/dm-XX"
+        // We create that device by running coldboot on /sys/block/dm-XX
+        std::string dm_device(basename(rec->blk_device));
+        std::string syspath = StringPrintf("/sys/block/%s", dm_device.c_str());
+        device_init(syspath.c_str(), [&](uevent* uevent) -> coldboot_action_t {
+            if (uevent->device_name && !strcmp(dm_device.c_str(), uevent->device_name)) {
+                LOG(VERBOSE) << "early_mount: creating dm-verity device : " << dm_device;
+                return COLDBOOT_STOP;
+            }
+            return COLDBOOT_CONTINUE;
+        });
+    }
+
+    if (rec && fs_mgr_do_mount_one(rec)) {
+        PLOG(ERROR) << "early_mount: Failed to mount '" << rec->mount_point << "'";
+        return false;
+    }
+
+    return true;
+}
+
+// Creates devices with uevent->partition_name matching one in the in/out
+// partition_names. Note that the partition_names MUST have A/B suffix
+// when A/B is used. Found partitions will then be removed from the
+// partition_names for caller to check which devices are NOT created.
+static void early_device_init(std::set<std::string>* partition_names) {
+    if (partition_names->empty()) {
+        return;
+    }
+    device_init(nullptr, [=](uevent* uevent) -> coldboot_action_t {
+        if (!strncmp(uevent->subsystem, "firmware", 8)) {
+            return COLDBOOT_CONTINUE;
+        }
+
+        // we need platform devices to create symlinks
+        if (!strncmp(uevent->subsystem, "platform", 8)) {
+            return COLDBOOT_CREATE;
+        }
+
+        // Ignore everything that is not a block device
+        if (strncmp(uevent->subsystem, "block", 5)) {
+            return COLDBOOT_CONTINUE;
+        }
+
+        if (uevent->partition_name) {
+            // match partition names to create device nodes for partitions
+            // both partition_names and uevent->partition_name have A/B suffix when A/B is used
+            auto iter = partition_names->find(uevent->partition_name);
+            if (iter != partition_names->end()) {
+                LOG(VERBOSE) << "early_mount: found partition: " << *iter;
+                partition_names->erase(iter);
+                if (partition_names->empty()) {
+                    return COLDBOOT_STOP;  // found all partitions, stop coldboot
+                } else {
+                    return COLDBOOT_CREATE;  // create this device and continue to find others
+                }
+            }
+        }
+        // Not found a partition or find an unneeded partition, continue to find others
+        return COLDBOOT_CONTINUE;
+    });
+}
+
+static bool get_early_partitions(const std::vector<fstab_rec*>& early_fstab_recs,
+                                 std::set<std::string>* out_partitions, bool* out_need_verity) {
+    std::string meta_partition;
+    out_partitions->clear();
+    *out_need_verity = false;
+
+    for (auto fstab_rec : early_fstab_recs) {
+        // don't allow verifyatboot for early mounted partitions
+        if (fs_mgr_is_verifyatboot(fstab_rec)) {
+            LOG(ERROR) << "early_mount: partitions can't be verified at boot";
+            return false;
+        }
+        // check for verified partitions
+        if (fs_mgr_is_verified(fstab_rec)) {
+            *out_need_verity = true;
+        }
+        // check if verity metadata is on a separate partition and get partition
+        // name from the end of the ->verity_loc path. verity state is not partition
+        // specific, so there must be only 1 additional partition that carries
+        // verity state.
+        if (fstab_rec->verity_loc) {
+            if (!meta_partition.empty()) {
+                LOG(ERROR) << "early_mount: more than one meta partition found: " << meta_partition
+                           << ", " << basename(fstab_rec->verity_loc);
+                return false;
+            } else {
+                meta_partition = basename(fstab_rec->verity_loc);
+            }
+        }
+    }
+
+    // includes those early mount partitions and meta_partition (if any)
+    // note that fstab_rec->blk_device has A/B suffix updated by fs_mgr when A/B is used
+    for (auto fstab_rec : early_fstab_recs) {
+        out_partitions->emplace(basename(fstab_rec->blk_device));
+    }
+
+    if (!meta_partition.empty()) {
+        out_partitions->emplace(std::move(meta_partition));
+    }
+
+    return true;
+}
+
+/* Early mount vendor and ODM partitions. The fstab is read from device-tree. */
+static bool early_mount() {
+    // skip early mount if we're in recovery mode
+    if (access("/sbin/recovery", F_OK) == 0) {
+        LOG(INFO) << "Early mount skipped (recovery mode)";
+        return true;
+    }
+
+    // first check if device tree fstab entries are compatible
+    if (!is_dt_fstab_compatible()) {
+        LOG(INFO) << "Early mount skipped (missing/incompatible fstab in device tree)";
+        return true;
+    }
+
+    std::unique_ptr<fstab, decltype(&fs_mgr_free_fstab)> tab(
+        fs_mgr_read_fstab_dt(), fs_mgr_free_fstab);
+    if (!tab) {
+        LOG(ERROR) << "Early mount failed to read fstab from device tree";
+        return false;
+    }
+
+    // find out fstab records for odm, system and vendor
+    std::vector<fstab_rec*> early_fstab_recs;
+    for (auto mount_point : {"/odm", "/system", "/vendor"}) {
+        fstab_rec* fstab_rec = fs_mgr_get_entry_for_mount_point(tab.get(), mount_point);
+        if (fstab_rec != nullptr) {
+            early_fstab_recs.push_back(fstab_rec);
+        }
+    }
+
+    // nothing to early mount
+    if (early_fstab_recs.empty()) return true;
+
+    bool need_verity;
+    std::set<std::string> partition_names;
+    // partition_names MUST have A/B suffix when A/B is used
+    if (!get_early_partitions(early_fstab_recs, &partition_names, &need_verity)) {
+        return false;
+    }
+
+    bool success = false;
+    // create the devices we need..
+    early_device_init(&partition_names);
+
+    // early_device_init will remove found partitions from partition_names
+    // So if the partition_names is not empty here, means some partitions
+    // are not found
+    if (!partition_names.empty()) {
+        LOG(ERROR) << "early_mount: partition(s) not found: "
+                   << android::base::Join(partition_names, ", ");
+        goto done;
+    }
+
+    if (need_verity) {
+        // create /dev/device mapper
+        device_init("/sys/devices/virtual/misc/device-mapper",
+                    [&](uevent* uevent) -> coldboot_action_t { return COLDBOOT_STOP; });
+    }
+
+    for (auto fstab_rec : early_fstab_recs) {
+        if (!early_mount_one(fstab_rec)) goto done;
+    }
+    success = true;
+
+done:
+    device_close();
+    return success;
 }
 
 int main(int argc, char** argv) {
@@ -593,12 +1046,17 @@ int main(int argc, char** argv) {
         return watchdogd_main(argc, argv);
     }
 
+    boot_clock::time_point start_time = boot_clock::now();
+
     // Clear the umask.
     umask(0);
 
     add_environment("PATH", _PATH_DEFPATH);
 
-    bool is_first_stage = (argc == 1) || (strcmp(argv[1], "--second-stage") != 0);
+    bool is_first_stage = (getenv("INIT_SECOND_STAGE") == nullptr);
+
+    // Don't expose the raw commandline to unprivileged processes.
+    chmod("/proc/cmdline", 0440);
 
     // Get the basic filesystem setup we need put together in the initramdisk
     // on / and then we'll let the rc file figure out the rest.
@@ -609,20 +1067,50 @@ int main(int argc, char** argv) {
         mount("devpts", "/dev/pts", "devpts", 0, NULL);
         #define MAKE_STR(x) __STRING(x)
         mount("proc", "/proc", "proc", 0, "hidepid=2,gid=" MAKE_STR(AID_READPROC));
+        gid_t groups[] = { AID_READPROC };
+        setgroups(arraysize(groups), groups);
         mount("sysfs", "/sys", "sysfs", 0, NULL);
+        mount("selinuxfs", "/sys/fs/selinux", "selinuxfs", 0, NULL);
+        mknod("/dev/kmsg", S_IFCHR | 0600, makedev(1, 11));
+        mknod("/dev/random", S_IFCHR | 0666, makedev(1, 8));
+        mknod("/dev/urandom", S_IFCHR | 0666, makedev(1, 9));
     }
 
-    // We must have some place other than / to create the device nodes for
-    // kmsg and null, otherwise we won't be able to remount / read-only
-    // later on. Now that tmpfs is mounted on /dev, we can actually talk
-    // to the outside world.
-    open_devnull_stdio();
-    klog_init();
-    klog_set_level(KLOG_NOTICE_LEVEL);
+    // Now that tmpfs is mounted on /dev and we have /dev/kmsg, we can actually
+    // talk to the outside world...
+    InitKernelLogging(argv);
 
-    NOTICE("init %s started!\n", is_first_stage ? "first stage" : "second stage");
+    LOG(INFO) << "init " << (is_first_stage ? "first" : "second") << " stage started!";
 
-    if (!is_first_stage) {
+    if (is_first_stage) {
+        if (!early_mount()) {
+            LOG(ERROR) << "Failed to mount required partitions early ...";
+            panic();
+        }
+
+        // Set up SELinux, loading the SELinux policy.
+        selinux_initialize(true);
+
+        // We're in the kernel domain, so re-exec init to transition to the init domain now
+        // that the SELinux policy has been loaded.
+        if (restorecon("/init") == -1) {
+            PLOG(ERROR) << "restorecon failed";
+            security_failure();
+        }
+
+        setenv("INIT_SECOND_STAGE", "true", 1);
+
+        static constexpr uint32_t kNanosecondsPerMillisecond = 1e6;
+        uint64_t start_ms = start_time.time_since_epoch().count() / kNanosecondsPerMillisecond;
+        setenv("INIT_STARTED_AT", StringPrintf("%" PRIu64, start_ms).c_str(), 1);
+
+        char* path = argv[0];
+        char* args[] = { path, nullptr };
+        if (execv(path, args) == -1) {
+            PLOG(ERROR) << "execv(\"" << path << "\") failed";
+            security_failure();
+        }
+    } else {
         // Indicate that booting is in progress to background fw loaders, etc.
         close(open("/dev/.booting", O_WRONLY | O_CREAT | O_CLOEXEC, 0000));
 
@@ -636,39 +1124,42 @@ int main(int argc, char** argv) {
         // Propagate the kernel variables to internal variables
         // used by init as well as the current required properties.
         export_kernel_boot_props();
-    }
 
-    // Set up SELinux, including loading the SELinux policy if we're in the kernel domain.
-    selinux_initialize(is_first_stage);
+        // Make the time that init started available for bootstat to log.
+        property_set("ro.boottime.init", getenv("INIT_STARTED_AT"));
+        property_set("ro.boottime.init.selinux", getenv("INIT_SELINUX_TOOK"));
 
-    // If we're in the kernel domain, re-exec init to transition to the init domain now
-    // that the SELinux policy has been loaded.
-    if (is_first_stage) {
-        if (restorecon("/init") == -1) {
-            ERROR("restorecon failed: %s\n", strerror(errno));
-            security_failure();
-        }
-        char* path = argv[0];
-        char* args[] = { path, const_cast<char*>("--second-stage"), nullptr };
-        if (execv(path, args) == -1) {
-            ERROR("execv(\"%s\") failed: %s\n", path, strerror(errno));
-            security_failure();
-        }
+        // Set libavb version for Framework-only OTA match in Treble build.
+        property_set("ro.boot.init.avb_version", std::to_string(AVB_MAJOR_VERSION).c_str());
+
+        // Clean up our environment.
+        unsetenv("INIT_SECOND_STAGE");
+        unsetenv("INIT_STARTED_AT");
+        unsetenv("INIT_SELINUX_TOOK");
+
+        // Now set up SELinux for second stage.
+        selinux_initialize(false);
     }
 
     // These directories were necessarily created before initial policy load
     // and therefore need their security context restored to the proper value.
     // This must happen before /dev is populated by ueventd.
-    NOTICE("Running restorecon...\n");
+    LOG(INFO) << "Running restorecon...";
     restorecon("/dev");
+    restorecon("/dev/kmsg");
     restorecon("/dev/socket");
+    restorecon("/dev/random");
+    restorecon("/dev/urandom");
     restorecon("/dev/__properties__");
-    restorecon("/property_contexts");
-    restorecon_recursive("/sys");
+    restorecon("/plat_property_contexts");
+    restorecon("/nonplat_property_contexts");
+    restorecon("/sys", SELINUX_ANDROID_RESTORECON_RECURSE);
+    restorecon("/dev/block", SELINUX_ANDROID_RESTORECON_RECURSE);
+    restorecon("/dev/device-mapper");
 
     epoll_fd = epoll_create1(EPOLL_CLOEXEC);
     if (epoll_fd == -1) {
-        ERROR("epoll_create1 failed: %s\n", strerror(errno));
+        PLOG(ERROR) << "epoll_create1 failed";
         exit(1);
     }
 
@@ -677,6 +1168,7 @@ int main(int argc, char** argv) {
     property_load_boot_defaults();
     export_oem_lock_status();
     start_property_service();
+    set_usb_controller();
 
     const BuiltinFunctionMap function_map;
     Action::set_function_map(&function_map);
@@ -685,7 +1177,20 @@ int main(int argc, char** argv) {
     parser.AddSectionParser("service",std::make_unique<ServiceParser>());
     parser.AddSectionParser("on", std::make_unique<ActionParser>());
     parser.AddSectionParser("import", std::make_unique<ImportParser>());
-    parser.ParseConfig("/init.rc");
+    std::string bootscript = property_get("ro.boot.init_rc");
+    if (bootscript.empty()) {
+        parser.ParseConfig("/init.rc");
+        parser.set_is_system_etc_init_loaded(
+                parser.ParseConfig("/system/etc/init"));
+        parser.set_is_vendor_etc_init_loaded(
+                parser.ParseConfig("/vendor/etc/init"));
+        parser.set_is_odm_etc_init_loaded(parser.ParseConfig("/odm/etc/init"));
+    } else {
+        parser.ParseConfig(bootscript);
+        parser.set_is_system_etc_init_loaded(true);
+        parser.set_is_vendor_etc_init_loaded(true);
+        parser.set_is_odm_etc_init_loaded(true);
+    }
 
     ActionManager& am = ActionManager::GetInstance();
 
@@ -696,6 +1201,7 @@ int main(int argc, char** argv) {
     // ... so that we can start queuing up actions that require stuff from /dev.
     am.QueueBuiltinAction(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
     am.QueueBuiltinAction(set_mmap_rnd_bits_action, "set_mmap_rnd_bits");
+    am.QueueBuiltinAction(set_kptr_restrict_action, "set_kptr_restrict");
     am.QueueBuiltinAction(keychord_init_action, "keychord_init");
     am.QueueBuiltinAction(console_init_action, "console_init");
 
@@ -718,28 +1224,27 @@ int main(int argc, char** argv) {
     am.QueueBuiltinAction(queue_property_triggers_action, "queue_property_triggers");
 
     while (true) {
-        if (!waiting_for_exec) {
+        if (!(waiting_for_exec || waiting_for_prop)) {
             am.ExecuteOneCommand();
             restart_processes();
         }
 
-        int timeout = -1;
-        if (process_needs_restart) {
-            timeout = (process_needs_restart - gettime()) * 1000;
-            if (timeout < 0)
-                timeout = 0;
+        // By default, sleep until something happens.
+        int epoll_timeout_ms = -1;
+
+        // If there's a process that needs restarting, wake up in time for that.
+        if (process_needs_restart_at != 0) {
+            epoll_timeout_ms = (process_needs_restart_at - time(nullptr)) * 1000;
+            if (epoll_timeout_ms < 0) epoll_timeout_ms = 0;
         }
 
-        if (am.HasMoreCommands()) {
-            timeout = 0;
-        }
-
-        bootchart_sample(&timeout);
+        // If there's more work to do, wake up again immediately.
+        if (am.HasMoreCommands()) epoll_timeout_ms = 0;
 
         epoll_event ev;
-        int nr = TEMP_FAILURE_RETRY(epoll_wait(epoll_fd, &ev, 1, timeout));
+        int nr = TEMP_FAILURE_RETRY(epoll_wait(epoll_fd, &ev, 1, epoll_timeout_ms));
         if (nr == -1) {
-            ERROR("epoll_wait failed: %s\n", strerror(errno));
+            PLOG(ERROR) << "epoll_wait failed";
         } else if (nr == 1) {
             ((void (*)()) ev.data.ptr)();
         }

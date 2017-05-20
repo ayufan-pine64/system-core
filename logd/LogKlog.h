@@ -17,8 +17,8 @@
 #ifndef _LOGD_LOG_KLOG_H__
 #define _LOGD_LOG_KLOG_H__
 
+#include <private/android_logger.h>
 #include <sysutils/SocketListener.h>
-#include <log/log_read.h>
 
 char *log_strntok_r(char *s, size_t *len, char **saveptr, size_t *sublen);
 
@@ -51,7 +51,7 @@ public:
 
 protected:
     void sniffTime(log_time &now, const char **buf, size_t len, bool reverse);
-    pid_t sniffPid(const char *buf, size_t len);
+    pid_t sniffPid(const char **buf, size_t len);
     void calculateCorrection(const log_time &monotonic,
                              const char *real_string, size_t len);
     virtual bool onDataAvailable(SocketClient *cli);

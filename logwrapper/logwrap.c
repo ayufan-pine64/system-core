@@ -14,24 +14,24 @@
  * limitations under the License.
  */
 
-#include <string.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <poll.h>
-#include <sys/wait.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <libgen.h>
-#include <stdbool.h>
+#include <poll.h>
 #include <pthread.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
-#include <logwrap/logwrap.h>
-#include "private/android_filesystem_config.h"
-#include "cutils/log.h"
 #include <cutils/klog.h>
+#include <log/log.h>
+#include <logwrap/logwrap.h>
+#include <private/android_filesystem_config.h>
 
 #define ARRAY_SIZE(x)   (sizeof(x) / sizeof(*(x)))
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -408,7 +408,7 @@ static int parent(const char *tag, int parent_read, pid_t pid,
         if (poll_fds[0].revents & POLLHUP) {
             int ret;
 
-            ret = waitpid(pid, &status, WNOHANG);
+            ret = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
             if (ret < 0) {
                 rc = errno;
                 ALOG(LOG_ERROR, "logwrap", "waitpid failed with %s\n", strerror(errno));
