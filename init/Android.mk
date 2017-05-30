@@ -34,6 +34,8 @@ init_cflags += \
     $(init_options) \
     -Wall -Wextra \
     -Wno-unused-parameter \
+		-Wno-unused-function \
+		-Wno-unused-value \
     -Werror \
     -std=gnu++1z \
 

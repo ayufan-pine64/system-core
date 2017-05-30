@@ -805,6 +805,15 @@ static int do_wait_for_prop(const std::vector<std::string>& args) {
     return 0;
 }
 
+static int do_setenforce(const std::vector<std::string>& args) {
+    if (is_selinux_enabled() <= 0)
+        return 0;
+    if (security_setenforce(atoi(args[1].c_str())) < 0) {
+        return -errno;
+    }
+    return 0;
+}
+
 /*
  * Callback to make a directory from the ext4 code
  */
@@ -874,6 +883,7 @@ const BuiltinFunctionMap::Map& BuiltinFunctionMap::map() const {
         {"restorecon_recursive",    {1,     kMax, do_restorecon_recursive}},
         {"rm",                      {1,     1,    do_rm}},
         {"rmdir",                   {1,     1,    do_rmdir}},
+        {"setenforce",              {1,     1,    do_setenforce}},
         {"setprop",                 {2,     2,    do_setprop}},
         {"setrlimit",               {3,     3,    do_setrlimit}},
         {"start",                   {1,     1,    do_start}},
