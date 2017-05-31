@@ -693,8 +693,8 @@ service console /system/bin/sh
     class core
     console
     disabled
-    user shell
-    group shell log readproc
+    user root
+    group root log readproc
     seclabel u:r:shell:s0
 
 on property:ro.debuggable=1
